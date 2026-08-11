@@ -1,0 +1,13 @@
+node_modules/
+.idea/
+.vscode/
+.next/
+.vinext/
+dist/
+.wrangler/
+.env
+.runtime/
+coverage/
+*.log
+backend/bin/
+backend/coverage.out

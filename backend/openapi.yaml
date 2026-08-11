@@ -1,0 +1,234 @@
+openapi: 3.1.0
+info:
+  title: 栖云家庭网盘 API
+  version: 0.1.0
+servers:
+  - url: /api/v1
+paths:
+  /bootstrap:
+    get:
+      summary: 查询系统是否已初始化
+      responses:
+        "200": { description: 初始化状态 }
+    post:
+      summary: 创建家庭与首位所有者
+      responses:
+        "200": { description: 初始化成功并创建登录会话 }
+  /auth/login:
+    post:
+      summary: 使用用户名和密码登录
+      responses:
+        "200": { description: 登录成功 }
+        "401": { description: 用户名或密码错误 }
+  /me:
+    get:
+      summary: 获取当前账户
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 当前账户资料与家庭角色 }
+    patch:
+      summary: 更新显示名称
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 账户资料已更新 }
+  /me/password:
+    post:
+      summary: 修改当前账户密码并退出其他会话
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 密码已更新 }
+  /spaces:
+    get:
+      summary: 获取当前成员可见空间
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 私有空间和家庭空间 }
+  /nodes:
+    get:
+      summary: 获取目录内容
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: spaceId, in: query, required: true, schema: { type: string, format: uuid } }
+        - { name: parentId, in: query, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 当前用户有权查看的节点 }
+  /folders:
+    post:
+      summary: 新建文件夹
+      security: [{ sessionCookie: [] }]
+      responses:
+        "201": { description: 文件夹已创建 }
+  /folders/tree:
+    get:
+      summary: 获取可作为移动目标的文件夹树
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 当前空间中可编辑的文件夹 }
+  /nodes/{id}:
+    patch:
+      summary: 重命名文件或文件夹
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 名称已更新 }
+    delete:
+      summary: 移到回收站
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: 已移到回收站 }
+  /nodes/{id}/move:
+    post:
+      summary: 移动文件或文件夹
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 已移动到目标目录 }
+  /nodes/{id}/permissions:
+    get:
+      summary: 获取目录或文件的权限配置
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 继承设置与成员权限 }
+    put:
+      summary: 更新目录或文件的权限配置
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 权限已更新 }
+  /uploads:
+    post:
+      summary: 创建直传或分片上传会话
+      security: [{ sessionCookie: [] }]
+      responses:
+        "201": { description: 上传会话及预签名信息 }
+    get:
+      summary: 获取最近上传任务
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 上传任务列表 }
+  /uploads/{id}/parts:
+    post:
+      summary: 批量签发 Multipart 分片 URL
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 预签名分片 URL }
+  /uploads/{id}/complete:
+    post:
+      summary: 完成并校验上传
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 文件已就绪 }
+  /photos:
+    get:
+      summary: 获取照片时间线
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 照片及短期缩略图地址 }
+  /photos/{id}:
+    patch:
+      summary: 更新照片备注
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 备注已更新 }
+  /albums:
+    get:
+      summary: 获取相册
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 相册列表 }
+    post:
+      summary: 创建相册
+      security: [{ sessionCookie: [] }]
+      responses:
+        "201": { description: 相册已创建 }
+  /albums/{id}:
+    patch:
+      summary: 更新相册名称与描述
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 相册已更新 }
+    delete:
+      summary: 删除相册但保留照片原文件
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: 相册已删除 }
+  /albums/{id}/items:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: 获取相册照片
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 按拍摄时间排列的照片 }
+    post:
+      summary: 添加照片到相册
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 照片已加入相册 }
+  /albums/{id}/permissions:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      summary: 获取相册权限配置
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 继承设置与成员权限 }
+    put:
+      summary: 更新相册权限配置
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 权限已更新 }
+  /shares:
+    get:
+      summary: 获取当前用户创建的分享
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 分享列表 }
+    post:
+      summary: 创建密码与有效期受控的分享
+      security: [{ sessionCookie: [] }]
+      responses:
+        "201": { description: 分享链接 }
+  /members:
+    get:
+      summary: 获取真实家庭成员
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 家庭成员与角色 }
+  /members/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      summary: 修改成员角色
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 成员角色已更新 }
+  /admin/audit:
+    get:
+      summary: 获取家庭最近活动与审计记录
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 最近 200 条审计事件 }
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: pan_session
