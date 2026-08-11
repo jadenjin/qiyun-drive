@@ -36,7 +36,7 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	input.Username = normalizeUsername(input.Username)
 	input.HouseholdName = strings.TrimSpace(input.HouseholdName)
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
-	if input.HouseholdName == "" || input.Username == "" || input.DisplayName == "" {
+	if input.HouseholdName == "" || len([]rune(input.HouseholdName)) > 100 || input.Username == "" || len([]rune(input.Username)) > 64 || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 || len(input.Timezone) > 100 {
 		writeError(w, http.StatusBadRequest, "invalid_input", "家庭名称、用户名和显示名称不能为空")
 		return
 	}
@@ -58,6 +58,10 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `SELECT pg_advisory_xact_lock(7328462101)`); err != nil {
+		internalError(w, err)
+		return
+	}
 	var exists bool
 	if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM households)`).Scan(&exists); err != nil || exists {
 		if err != nil {
@@ -95,6 +99,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if len([]rune(input.Username)) > 64 || len([]rune(input.Password)) > 128 {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
 	var userID uuid.UUID
@@ -251,7 +259,7 @@ func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Username = normalizeUsername(input.Username)
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
-	if input.Username == "" || input.DisplayName == "" {
+	if len(input.Token) > 256 || input.Username == "" || len([]rune(input.Username)) > 64 || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 {
 		writeError(w, http.StatusBadRequest, "invalid_input", "用户名和显示名称不能为空")
 		return
 	}
@@ -399,6 +407,10 @@ func (s *Server) createPasswordReset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 	var input struct{ Token, Password string }
 	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if len(input.Token) > 256 {
+		writeError(w, http.StatusGone, "invalid_reset", "重置链接无效或已过期")
 		return
 	}
 	if err := validatePassword(input.Password); err != nil {

@@ -13,6 +13,7 @@ type Config struct {
 	PublicBaseURL    string
 	AllowedOrigin    string
 	CookieSecure     bool
+	TrustProxy       bool
 	S3Endpoint       string
 	S3PublicEndpoint string
 	S3Region         string
@@ -31,6 +32,7 @@ func Load() Config {
 		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:3000"), "/"),
 		AllowedOrigin:    strings.TrimRight(env("ALLOWED_ORIGIN", "http://localhost:3000"), "/"),
 		CookieSecure:     envBool("COOKIE_SECURE", false),
+		TrustProxy:       envBool("TRUST_PROXY", false),
 		S3Endpoint:       strings.TrimRight(env("S3_ENDPOINT", "http://localhost:9000"), "/"),
 		S3PublicEndpoint: strings.TrimRight(env("S3_PUBLIC_ENDPOINT", "http://localhost:9000"), "/"),
 		S3Region:         env("S3_REGION", "us-east-1"),

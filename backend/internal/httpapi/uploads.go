@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/http"
 	"path/filepath"
@@ -16,7 +18,15 @@ import (
 	"pan/backend/internal/storage"
 )
 
-const multipartThreshold int64 = 32 << 20
+const (
+	multipartThreshold int64 = 32 << 20
+	maxObjectSize      int64 = 5 << 40
+)
+
+var (
+	errUploadPathForbidden = errors.New("upload path is not editable")
+	errUploadPathConflict  = errors.New("upload path conflicts with a file")
+)
 
 type uploadRecord struct {
 	ID           uuid.UUID
@@ -52,6 +62,10 @@ func (s *Server) createUploadBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "too_many_entries", "每批最多提交 500 个目录")
 		return
 	}
+	if input.TotalFiles < 1 || input.TotalFiles > 100000 {
+		writeError(w, http.StatusBadRequest, "invalid_file_count", "每批文件数量需为 1 至 100000")
+		return
+	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		internalError(w, err)
@@ -64,8 +78,14 @@ func (s *Server) createUploadBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_path", "目录路径不合法")
 			return
 		}
-		if _, err := s.ensureFolderPath(r.Context(), tx, input.SpaceID, input.ParentID, parts, a.UserID); err != nil {
-			internalError(w, err)
+		if _, err := s.ensureFolderPath(r.Context(), tx, a, input.SpaceID, input.ParentID, parts); err != nil {
+			if errors.Is(err, errUploadPathForbidden) {
+				writeError(w, http.StatusNotFound, "not_found", "目标目录不存在")
+			} else if errors.Is(err, errUploadPathConflict) {
+				writeError(w, http.StatusConflict, "path_conflict", "目录路径与已有文件冲突")
+			} else {
+				internalError(w, err)
+			}
 			return
 		}
 	}
@@ -102,18 +122,26 @@ func cleanRelativePath(value string) ([]string, error) {
 	return parts, nil
 }
 
-func (s *Server) ensureFolderPath(ctx context.Context, tx pgx.Tx, spaceID uuid.UUID, parentID *uuid.UUID, parts []string, userID uuid.UUID) (*uuid.UUID, error) {
+func (s *Server) ensureFolderPath(ctx context.Context, tx pgx.Tx, a actor, spaceID uuid.UUID, parentID *uuid.UUID, parts []string) (*uuid.UUID, error) {
 	current := parentID
 	for _, name := range parts {
 		var id uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT id FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND kind='folder' AND deleted_at IS NULL`, spaceID, current, name).Scan(&id)
+		var kind string
+		err := tx.QueryRow(ctx, `SELECT id,kind FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL`, spaceID, current, name).Scan(&id, &kind)
 		if err == pgx.ErrNoRows {
 			id = uuid.New()
-			if _, err := tx.Exec(ctx, `INSERT INTO nodes(id,space_id,parent_id,kind,name,created_by) VALUES($1,$2,$3,'folder',$4,$5)`, id, spaceID, current, name, userID); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO nodes(id,space_id,parent_id,kind,name,created_by) VALUES($1,$2,$3,'folder',$4,$5)`, id, spaceID, current, name, a.UserID); err != nil {
 				return nil, err
 			}
 		} else if err != nil {
 			return nil, err
+		} else if kind != "folder" {
+			return nil, errUploadPathConflict
+		} else {
+			level, permissionErr := nodePermissionWith(ctx, tx, a, id)
+			if permissionErr != nil || level < permissionEditor {
+				return nil, errUploadPathForbidden
+			}
 		}
 		current = &id
 	}
@@ -135,8 +163,8 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if input.SizeBytes < 0 {
-		writeError(w, http.StatusBadRequest, "invalid_size", "文件大小不合法")
+	if input.SizeBytes < 0 || input.SizeBytes > maxObjectSize {
+		writeError(w, http.StatusBadRequest, "invalid_size", "文件大小不合法，单个文件最大为 5 TB")
 		return
 	}
 	level, err := s.parentPermission(r.Context(), a, input.SpaceID, input.ParentID)
@@ -178,18 +206,39 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	if input.BatchID != nil {
+		var validBatch bool
+		if err := tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM upload_batches WHERE id=$1 AND space_id=$2 AND created_by=$3 AND expires_at>now())`, *input.BatchID, input.SpaceID, a.UserID).Scan(&validBatch); err != nil {
+			internalError(w, err)
+			return
+		}
+		if !validBatch {
+			writeError(w, http.StatusNotFound, "invalid_batch", "上传批次不存在或已过期")
+			return
+		}
+	}
 	var quota, used, reserved int64
 	if err := tx.QueryRow(r.Context(), `SELECT quota_bytes,used_bytes,reserved_bytes FROM spaces WHERE id=$1 FOR UPDATE`, input.SpaceID).Scan(&quota, &used, &reserved); err != nil {
 		internalError(w, err)
 		return
 	}
-	if quota > 0 && used+reserved+input.SizeBytes > quota {
+	if used > math.MaxInt64-reserved || used+reserved > math.MaxInt64-input.SizeBytes {
+		writeError(w, http.StatusConflict, "quota_exceeded", "空间容量记录已达到上限")
+		return
+	}
+	if quota > 0 && input.SizeBytes > quota-used-reserved {
 		writeError(w, http.StatusConflict, "quota_exceeded", "空间配额不足")
 		return
 	}
-	parentID, err := s.ensureFolderPath(r.Context(), tx, input.SpaceID, input.ParentID, directories, a.UserID)
+	parentID, err := s.ensureFolderPath(r.Context(), tx, a, input.SpaceID, input.ParentID, directories)
 	if err != nil {
-		internalError(w, err)
+		if errors.Is(err, errUploadPathForbidden) {
+			writeError(w, http.StatusNotFound, "not_found", "目标目录不存在")
+		} else if errors.Is(err, errUploadPathConflict) {
+			writeError(w, http.StatusConflict, "path_conflict", "目录路径与已有文件冲突")
+		} else {
+			internalError(w, err)
+		}
 		return
 	}
 	name, err = s.resolveConflict(r.Context(), tx, a, input.SpaceID, parentID, name, input.Conflict)
@@ -273,7 +322,7 @@ func (s *Server) resolveConflict(ctx context.Context, tx pgx.Tx, a actor, spaceI
 		if existingKind != "file" {
 			return "", fmt.Errorf("conflict")
 		}
-		level, err := s.nodePermission(ctx, a, existingID)
+		level, err := nodePermissionWith(ctx, tx, a, existingID)
 		if err != nil || level < permissionEditor {
 			return "", fmt.Errorf("conflict")
 		}
@@ -320,6 +369,10 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 	upload, err := s.getUpload(r.Context(), id, a.UserID)
 	if err != nil || upload.Method != "multipart" || upload.UploadID == nil || upload.ExpiresAt.Before(time.Now()) {
 		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在或已过期")
+		return
+	}
+	if upload.State == "ready" {
+		writeError(w, http.StatusConflict, "upload_finalized", "已完成的上传不能继续签发分片")
 		return
 	}
 	var input struct {
@@ -478,16 +531,23 @@ func (s *Server) abortUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
 		return
 	}
-	if upload.UploadID != nil {
-		_ = s.store.AbortMultipart(r.Context(), upload.ObjectKey, *upload.UploadID)
-	}
-	_ = s.store.Delete(r.Context(), upload.ObjectKey)
 	tx, err := s.db.Begin(r.Context())
-	if err == nil {
-		_, err = tx.Exec(r.Context(), `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, upload.ExpectedSize, upload.SpaceID)
+	if err != nil {
+		internalError(w, err)
+		return
 	}
-	if err == nil {
-		_, err = tx.Exec(r.Context(), `UPDATE upload_sessions SET state='aborted' WHERE id=$1`, upload.ID)
+	defer tx.Rollback(r.Context())
+	var lockedState string
+	if err := tx.QueryRow(r.Context(), `SELECT state FROM upload_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`, upload.ID, a.UserID).Scan(&lockedState); err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
+		return
+	}
+	if lockedState == "ready" {
+		writeError(w, http.StatusConflict, "upload_finalized", "已完成的上传不能取消，请从文件列表删除")
+		return
+	}
+	if lockedState == "pending" || lockedState == "uploading" || lockedState == "completing" {
+		_, err = tx.Exec(r.Context(), `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, upload.ExpectedSize, upload.SpaceID)
 	}
 	if err == nil {
 		_, err = tx.Exec(r.Context(), `DELETE FROM nodes WHERE id=$1`, upload.NodeID)
@@ -496,13 +556,20 @@ func (s *Server) abortUpload(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `DELETE FROM assets WHERE id=$1`, upload.AssetID)
 	}
 	if err != nil {
-		_ = tx.Rollback(r.Context())
 		internalError(w, err)
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
 		internalError(w, err)
 		return
+	}
+	if upload.UploadID != nil {
+		if err := s.store.AbortMultipart(r.Context(), upload.ObjectKey, *upload.UploadID); err != nil {
+			slog.Warn("multipart cleanup failed", "upload_id", upload.ID, "error", err)
+		}
+	}
+	if err := s.store.Delete(r.Context(), upload.ObjectKey); err != nil {
+		slog.Warn("object cleanup failed", "upload_id", upload.ID, "error", err)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

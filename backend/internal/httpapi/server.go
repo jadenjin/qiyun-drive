@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -29,13 +31,17 @@ type Server struct {
 }
 
 type attemptWindow struct {
-	count int
-	reset time.Time
+	failures int
+	reset    time.Time
 }
 
 type attemptLimiter struct {
-	mu      sync.Mutex
-	windows map[string]attemptWindow
+	mu          sync.Mutex
+	windows     map[string]attemptWindow
+	window      time.Duration
+	maxFailures int
+	maxEntries  int
+	lastCleanup time.Time
 }
 
 type actor struct {
@@ -51,9 +57,9 @@ type contextKey string
 const actorKey contextKey = "actor"
 
 func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler {
-	s := &Server{db: db, store: store, cfg: cfg, limit: &attemptLimiter{windows: make(map[string]attemptWindow)}}
+	s := &Server{db: db, store: store, cfg: cfg, limit: newAttemptLimiter()}
 	r := chi.NewRouter()
-	r.Use(s.recoverer, s.requestLog, s.cors)
+	r.Use(s.recoverer, s.securityHeaders, s.requestLog, s.cors)
 	r.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	})
@@ -120,24 +126,122 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 
 func (s *Server) limitSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		client := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0])
-		if client == "" {
-			client, _, _ = net.SplitHostPort(r.RemoteAddr)
-		}
-		key := client + ":" + r.URL.Path
+		key := s.clientIP(r) + ":" + r.URL.Path
 		now := time.Now()
-		s.limit.mu.Lock()
-		window := s.limit.windows[key]
-		if window.reset.Before(now) {
-			window = attemptWindow{reset: now.Add(5 * time.Minute)}
-		}
-		window.count++
-		s.limit.windows[key] = window
-		s.limit.mu.Unlock()
-		if window.count > 10 {
-			w.Header().Set("Retry-After", "300")
+		allowed, retryAfter := s.limit.allowed(key, now)
+		if !allowed {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(math.Ceil(retryAfter.Seconds()))))
 			writeError(w, http.StatusTooManyRequests, "rate_limited", "尝试次数过多，请稍后再试")
 			return
+		}
+		recorder := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		if recorder.status >= 200 && recorder.status < 400 {
+			s.limit.clear(key)
+		} else if recorder.status == http.StatusUnauthorized || recorder.status == http.StatusForbidden || recorder.status == http.StatusNotFound || recorder.status == http.StatusGone {
+			s.limit.recordFailure(key, time.Now())
+		}
+	})
+}
+
+func newAttemptLimiter() *attemptLimiter {
+	return &attemptLimiter{windows: make(map[string]attemptWindow), window: 5 * time.Minute, maxFailures: 10, maxEntries: 10000}
+}
+
+func (l *attemptLimiter) allowed(key string, now time.Time) (bool, time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cleanupLocked(now)
+	window, ok := l.windows[key]
+	if !ok || !window.reset.After(now) {
+		return true, 0
+	}
+	if window.failures >= l.maxFailures {
+		return false, window.reset.Sub(now)
+	}
+	return true, 0
+}
+
+func (l *attemptLimiter) recordFailure(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cleanupLocked(now)
+	window, ok := l.windows[key]
+	if !ok || !window.reset.After(now) {
+		if len(l.windows) >= l.maxEntries {
+			for candidate := range l.windows {
+				delete(l.windows, candidate)
+				break
+			}
+		}
+		window = attemptWindow{reset: now.Add(l.window)}
+	}
+	window.failures++
+	l.windows[key] = window
+}
+
+func (l *attemptLimiter) clear(key string) {
+	l.mu.Lock()
+	delete(l.windows, key)
+	l.mu.Unlock()
+}
+
+func (l *attemptLimiter) cleanupLocked(now time.Time) {
+	if len(l.windows) < l.maxEntries && l.lastCleanup.Add(time.Minute).After(now) {
+		return
+	}
+	for key, window := range l.windows {
+		if !window.reset.After(now) {
+			delete(l.windows, key)
+		}
+	}
+	l.lastCleanup = now
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if candidate := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); net.ParseIP(candidate) != nil {
+			return candidate
+		}
+	}
+	client, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && client != "" {
+		return client
+	}
+	return r.RemoteAddr
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (w *statusRecorder) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusRecorder) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	written, err := w.ResponseWriter.Write(body)
+	w.bytes += written
+	return written, err
+}
+
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -178,8 +282,18 @@ func (s *Server) cors(next http.Handler) http.Handler {
 func (s *Server) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		next.ServeHTTP(w, r)
-		slog.Info("request", "method", r.Method, "path", r.URL.Path, "duration_ms", time.Since(started).Milliseconds())
+		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+		if requestID == "" || len(requestID) > 128 {
+			requestID = uuid.NewString()
+		}
+		w.Header().Set("X-Request-ID", requestID)
+		recorder := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		slog.Info("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "status", status, "bytes", recorder.bytes, "duration_ms", time.Since(started).Milliseconds())
 	})
 }
 
@@ -230,6 +344,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if err := decoder.Decode(dst); err != nil {
 		slog.Warn("invalid request json", "method", r.Method, "path", r.URL.Path, "error", err)
 		writeError(w, http.StatusBadRequest, "invalid_json", "请求内容格式不正确")
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		slog.Warn("invalid trailing json", "method", r.Method, "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusBadRequest, "invalid_json", "请求内容只能包含一个 JSON 对象")
 		return false
 	}
 	return true
@@ -284,8 +403,12 @@ func (s *Server) audit(ctx context.Context, a actor, action, resourceType string
 func normalizeUsername(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
 
 func validatePassword(value string) error {
-	if len([]rune(value)) < 10 {
+	length := len([]rune(value))
+	if length < 10 {
 		return fmt.Errorf("密码至少需要 10 个字符")
+	}
+	if length > 128 {
+		return fmt.Errorf("密码不能超过 128 个字符")
 	}
 	return nil
 }

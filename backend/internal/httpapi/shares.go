@@ -26,6 +26,10 @@ func (s *Server) createShare(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
+	if len([]rune(input.Password)) > 128 {
+		writeError(w, http.StatusBadRequest, "invalid_password", "分享密码不能超过 128 个字符")
+		return
+	}
 	dbResourceType := input.ResourceType
 	var level int
 	var err error
@@ -130,6 +134,10 @@ func (s *Server) unlockShare(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if len(token) > 256 || len([]rune(input.Password)) > 128 {
+		writeError(w, http.StatusNotFound, "not_found", "分享不存在或已失效")
 		return
 	}
 	var shareID uuid.UUID

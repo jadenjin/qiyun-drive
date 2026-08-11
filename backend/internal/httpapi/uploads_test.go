@@ -32,6 +32,14 @@ func TestChoosePartSizeStaysWithinMultipartLimit(t *testing.T) {
 	}
 }
 
+func TestMaximumObjectSizeStaysWithinMultipartLimit(t *testing.T) {
+	partSize := choosePartSize(maxObjectSize)
+	parts := (maxObjectSize + partSize - 1) / partSize
+	if parts > 10000 {
+		t.Fatalf("maximum object requires too many parts: %d", parts)
+	}
+}
+
 func TestSupportedPhotoMimeTypes(t *testing.T) {
 	for _, value := range []string{"image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif"} {
 		if !isPhotoMime(value) {

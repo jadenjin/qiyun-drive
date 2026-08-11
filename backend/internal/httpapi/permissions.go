@@ -41,10 +41,19 @@ func permissionName(level int) string {
 }
 
 func (s *Server) spacePermission(ctx context.Context, a actor, spaceID uuid.UUID) (int, error) {
+	return spacePermissionWith(ctx, s.db, a, spaceID)
+}
+
+type permissionQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+func spacePermissionWith(ctx context.Context, db permissionQuerier, a actor, spaceID uuid.UUID) (int, error) {
 	var kind string
 	var ownerID *uuid.UUID
 	var householdID uuid.UUID
-	err := s.db.QueryRow(ctx, `SELECT kind,owner_user_id,household_id FROM spaces WHERE id=$1`, spaceID).Scan(&kind, &ownerID, &householdID)
+	err := db.QueryRow(ctx, `SELECT kind,owner_user_id,household_id FROM spaces WHERE id=$1`, spaceID).Scan(&kind, &ownerID, &householdID)
 	if err != nil {
 		return permissionNone, err
 	}
@@ -64,16 +73,20 @@ func (s *Server) spacePermission(ctx context.Context, a actor, spaceID uuid.UUID
 }
 
 func (s *Server) nodePermission(ctx context.Context, a actor, nodeID uuid.UUID) (int, error) {
+	return nodePermissionWith(ctx, s.db, a, nodeID)
+}
+
+func nodePermissionWith(ctx context.Context, db permissionQuerier, a actor, nodeID uuid.UUID) (int, error) {
 	var spaceID uuid.UUID
-	err := s.db.QueryRow(ctx, `SELECT space_id FROM nodes WHERE id=$1`, nodeID).Scan(&spaceID)
+	err := db.QueryRow(ctx, `SELECT space_id FROM nodes WHERE id=$1`, nodeID).Scan(&spaceID)
 	if err != nil {
 		return permissionNone, err
 	}
-	base, err := s.spacePermission(ctx, a, spaceID)
+	base, err := spacePermissionWith(ctx, db, a, spaceID)
 	if err != nil || base == permissionNone || base == permissionManager {
 		return base, err
 	}
-	rows, err := s.db.Query(ctx, `
+	rows, err := db.Query(ctx, `
 		WITH RECURSIVE chain AS (
 		  SELECT id,parent_id,inherit_permissions,0 AS depth FROM nodes WHERE id=$1
 		  UNION ALL
@@ -103,18 +116,22 @@ func (s *Server) nodePermission(ctx context.Context, a actor, nodeID uuid.UUID) 
 }
 
 func (s *Server) albumPermission(ctx context.Context, a actor, albumID uuid.UUID) (int, error) {
+	return albumPermissionWith(ctx, s.db, a, albumID)
+}
+
+func albumPermissionWith(ctx context.Context, db permissionQuerier, a actor, albumID uuid.UUID) (int, error) {
 	var spaceID uuid.UUID
 	var inherit bool
-	err := s.db.QueryRow(ctx, `SELECT space_id,inherit_permissions FROM albums WHERE id=$1`, albumID).Scan(&spaceID, &inherit)
+	err := db.QueryRow(ctx, `SELECT space_id,inherit_permissions FROM albums WHERE id=$1`, albumID).Scan(&spaceID, &inherit)
 	if err != nil {
 		return permissionNone, err
 	}
-	base, err := s.spacePermission(ctx, a, spaceID)
+	base, err := spacePermissionWith(ctx, db, a, spaceID)
 	if err != nil || base == permissionNone || base == permissionManager {
 		return base, err
 	}
 	var explicit string
-	err = s.db.QueryRow(ctx, `SELECT permission FROM acl_entries WHERE resource_type='album' AND resource_id=$1 AND principal_user_id=$2`, albumID, a.UserID).Scan(&explicit)
+	err = db.QueryRow(ctx, `SELECT permission FROM acl_entries WHERE resource_type='album' AND resource_id=$1 AND principal_user_id=$2`, albumID, a.UserID).Scan(&explicit)
 	if err == nil {
 		return permissionLevel(explicit), nil
 	}
