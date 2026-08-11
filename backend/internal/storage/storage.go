@@ -55,6 +55,11 @@ func (s *Store) EnsureBucket(ctx context.Context) error {
 	return err
 }
 
+func (s *Store) Ready(ctx context.Context) error {
+	_, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)})
+	return err
+}
+
 func (s *Store) PresignPut(ctx context.Context, key, mime string) (string, error) {
 	request, err := s.signer.PresignPutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(key), ContentType: aws.String(mime),

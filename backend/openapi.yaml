@@ -121,6 +121,15 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
       responses:
         "200": { description: 预签名分片 URL }
+  /uploads/{id}/resume:
+    post:
+      summary: 校验上传会话并刷新续传地址
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: 最新上传状态与预签名信息 }
+        "410": { description: 上传会话已失效 }
   /uploads/{id}/complete:
     post:
       summary: 完成并校验上传

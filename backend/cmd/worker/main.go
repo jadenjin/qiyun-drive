@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"pan/backend/internal/config"
@@ -33,6 +35,8 @@ type job struct {
 	Payload  []byte
 	Attempts int
 }
+
+const jobTimeout = 10 * time.Minute
 
 func main() {
 	cfg := config.Load()
@@ -68,7 +72,10 @@ func (w *worker) runOne(ctx context.Context) error {
 		WHERE state IN ('pending','failed') AND run_after<=now() AND attempts<6
 		ORDER BY run_after FOR UPDATE SKIP LOCKED LIMIT 1`).Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempts)
 	if err != nil {
-		return nil
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE jobs SET state='running',attempts=attempts+1,locked_at=now(),updated_at=now() WHERE id=$1`, j.ID); err != nil {
 		return err
@@ -76,21 +83,33 @@ func (w *worker) runOne(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
+	jobCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+	defer cancel()
 	switch j.Kind {
 	case "index_photo":
-		err = w.indexPhoto(ctx, j.Payload)
+		err = w.indexPhoto(jobCtx, j.Payload)
 	case "purge_node":
-		err = w.purgeNode(ctx, j.Payload)
+		err = w.purgeNode(jobCtx, j.Payload)
+	case "cleanup_upload":
+		err = w.cleanupUpload(jobCtx, j.Payload)
 	default:
 		err = fmt.Errorf("unknown job kind %q", j.Kind)
 	}
 	if err == nil {
-		_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='done',updated_at=now(),last_error=NULL WHERE id=$1`, j.ID)
+		_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='done',locked_at=NULL,updated_at=now(),last_error=NULL WHERE id=$1`, j.ID)
 		return nil
 	}
 	backoff := time.Duration(1<<min(j.Attempts, 5)) * time.Minute
-	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',last_error=$1,run_after=$2,updated_at=now() WHERE id=$3`, err.Error(), time.Now().Add(backoff), j.ID)
+	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error=$1,run_after=$2,updated_at=now() WHERE id=$3`, truncateError(err), time.Now().Add(backoff), j.ID)
 	return err
+}
+
+func truncateError(err error) string {
+	message := []rune(err.Error())
+	if len(message) > 2000 {
+		return string(message[:2000])
+	}
+	return string(message)
 }
 
 func (w *worker) indexPhoto(ctx context.Context, payload []byte) error {
@@ -281,7 +300,8 @@ func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
 }
 
 func (w *worker) runMaintenance(ctx context.Context) {
-	w.cleanupExpiredUploads(ctx)
+	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error='任务执行中断，已自动恢复',run_after=now(),updated_at=now() WHERE state='running' AND locked_at<now()-interval '15 minutes'`)
+	w.enqueueExpiredUploadCleanup(ctx)
 	_, _ = w.db.Exec(ctx, `DELETE FROM sessions WHERE expires_at<now()`)
 	_, _ = w.db.Exec(ctx, `DELETE FROM share_access_tokens WHERE expires_at<now()`)
 	_, _ = w.db.Exec(ctx, `
@@ -289,58 +309,106 @@ func (w *worker) runMaintenance(ctx context.Context) {
 		SELECT gen_random_uuid(),'purge_node',jsonb_build_object('nodeId',n.id::text)
 		FROM nodes n WHERE n.deleted_at<now()-$1::interval
 		AND NOT EXISTS(SELECT 1 FROM nodes p WHERE p.id=n.parent_id AND p.deleted_at IS NOT NULL)
-		AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='purge_node' AND j.state IN ('pending','running','failed') AND j.payload->>'nodeId'=n.id::text)
+		AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='purge_node' AND (j.state IN ('pending','running') OR (j.state='failed' AND (j.attempts<6 OR j.updated_at>now()-interval '24 hours'))) AND j.payload->>'nodeId'=n.id::text)
 		LIMIT 25`, durationInterval(w.cfg.TrashRetention))
 }
 
-func (w *worker) cleanupExpiredUploads(ctx context.Context) {
-	rows, err := w.db.Query(ctx, `
-		SELECT u.id,u.node_id,u.asset_id,a.space_id,a.object_key,u.upload_id,u.expected_size,u.state
-		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id
-		WHERE (u.state IN ('pending','uploading','completing') AND u.expires_at<now())
-		   OR (u.state='failed' AND u.created_at<now()-interval '1 hour')
-		ORDER BY u.created_at LIMIT 20`)
+func (w *worker) enqueueExpiredUploadCleanup(ctx context.Context) {
+	_, _ = w.db.Exec(ctx, `
+		INSERT INTO jobs(id,kind,payload)
+		SELECT gen_random_uuid(),'cleanup_upload',jsonb_build_object('uploadId',u.id::text)
+		FROM upload_sessions u
+		WHERE ((u.state IN ('pending','uploading','completing') AND u.expires_at<now()) OR u.state='expired' OR (u.state='failed' AND u.created_at<now()-interval '1 hour'))
+		AND NOT EXISTS(
+			SELECT 1 FROM jobs j WHERE j.kind='cleanup_upload'
+			AND (j.state IN ('pending','running') OR (j.state='failed' AND (j.attempts<6 OR j.updated_at>now()-interval '24 hours')))
+			AND j.payload->>'uploadId'=u.id::text
+		)
+		ORDER BY u.created_at LIMIT 25`)
+}
+
+func (w *worker) cleanupUpload(ctx context.Context, payload []byte) error {
+	var input struct {
+		UploadID string `json:"uploadId"`
+	}
+	if err := json.Unmarshal(payload, &input); err != nil {
+		return err
+	}
+	uploadID, err := uuid.Parse(input.UploadID)
 	if err != nil {
-		return
+		return err
 	}
-	type expiredUpload struct {
-		id, nodeID, assetID, spaceID uuid.UUID
-		key, state                   string
-		uploadID                     *string
-		expected                     int64
+	var nodeID, assetID, spaceID uuid.UUID
+	var key, state string
+	var multipartID *string
+	var expected int64
+	var expiresAt, createdAt time.Time
+	err = w.db.QueryRow(ctx, `
+		SELECT u.node_id,u.asset_id,a.space_id,a.object_key,u.upload_id,u.expected_size,u.state,u.expires_at,u.created_at
+		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id WHERE u.id=$1`, uploadID).Scan(&nodeID, &assetID, &spaceID, &key, &multipartID, &expected, &state, &expiresAt, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
 	}
-	items := make([]expiredUpload, 0)
-	for rows.Next() {
-		var item expiredUpload
-		if err := rows.Scan(&item.id, &item.nodeID, &item.assetID, &item.spaceID, &item.key, &item.uploadID, &item.expected, &item.state); err == nil {
-			items = append(items, item)
-		}
+	if err != nil {
+		return err
 	}
-	rows.Close()
-	for _, item := range items {
-		if item.uploadID != nil {
-			_ = w.store.AbortMultipart(ctx, item.key, *item.uploadID)
-		}
-		_ = w.store.Delete(ctx, item.key)
-		tx, err := w.db.Begin(ctx)
+	activeExpired, failedExpired := cleanupEligibility(state, expiresAt, createdAt, time.Now())
+	if !activeExpired && !failedExpired {
+		return nil
+	}
+	if state != "expired" && activeExpired {
+		claim, err := w.db.Exec(ctx, `UPDATE upload_sessions SET state='expired' WHERE id=$1 AND state IN ('pending','uploading','completing') AND expires_at<now()`, uploadID)
 		if err != nil {
-			continue
+			return err
 		}
-		if item.state != "failed" {
-			_, err = tx.Exec(ctx, `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, item.expected, item.spaceID)
+		if claim.RowsAffected() == 0 {
+			return nil
 		}
-		if err == nil {
-			_, err = tx.Exec(ctx, `DELETE FROM nodes WHERE id=$1`, item.nodeID)
-		}
-		if err == nil {
-			_, err = tx.Exec(ctx, `DELETE FROM assets WHERE id=$1`, item.assetID)
-		}
-		if err != nil {
-			_ = tx.Rollback(ctx)
-			continue
-		}
-		_ = tx.Commit(ctx)
+		state = "expired"
 	}
+	if multipartID != nil {
+		if err := w.store.AbortMultipart(ctx, key, *multipartID); err != nil {
+			slog.Warn("abort expired multipart", "upload_id", uploadID, "error", err)
+		}
+	}
+	if err := w.store.Delete(ctx, key); err != nil {
+		return err
+	}
+	tx, err := w.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var lockedState string
+	var lockedCreated time.Time
+	if err := tx.QueryRow(ctx, `SELECT state,created_at FROM upload_sessions WHERE id=$1 FOR UPDATE`, uploadID).Scan(&lockedState, &lockedCreated); errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	releaseReservation := lockedState == "expired"
+	canDelete := releaseReservation || (lockedState == "failed" && lockedCreated.Before(time.Now().Add(-time.Hour)))
+	if !canDelete {
+		return nil
+	}
+	if releaseReservation {
+		if _, err := tx.Exec(ctx, `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, expected, spaceID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id=$1`, nodeID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM assets WHERE id=$1`, assetID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func cleanupEligibility(state string, expiresAt, createdAt, now time.Time) (activeExpired, failedExpired bool) {
+	activeExpired = ((state == "pending" || state == "uploading" || state == "completing") && expiresAt.Before(now)) || state == "expired"
+	failedExpired = state == "failed" && createdAt.Before(now.Add(-time.Hour))
+	return activeExpired, failedExpired
 }
 
 func durationInterval(value time.Duration) string {

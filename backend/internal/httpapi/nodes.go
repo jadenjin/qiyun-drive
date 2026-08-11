@@ -98,6 +98,7 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		SELECT n.id,n.space_id,n.parent_id,n.asset_id,n.kind,n.name,COALESCE(a.size_bytes,0),COALESCE(a.mime_type,''),COALESCE(a.status,'ready'),n.created_at,n.updated_at
 		FROM nodes n LEFT JOIN assets a ON a.id=n.asset_id
 		WHERE n.space_id=$1 AND n.parent_id IS NOT DISTINCT FROM $2 AND n.deleted_at IS NULL
+		AND (n.kind='folder' OR a.status IN ('pending','ready'))
 		ORDER BY CASE n.kind WHEN 'folder' THEN 0 ELSE 1 END, lower(n.name)`, spaceID, parentID)
 	if err != nil {
 		internalError(w, err)

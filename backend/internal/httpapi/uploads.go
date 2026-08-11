@@ -346,9 +346,25 @@ func (s *Server) resolveConflict(ctx context.Context, tx pgx.Tx, a actor, spaceI
 }
 
 func (s *Server) failUpload(ctx context.Context, sessionID, assetID, spaceID uuid.UUID, reserved int64) {
-	_, _ = s.db.Exec(ctx, `UPDATE upload_sessions SET state='failed' WHERE id=$1`, sessionID)
-	_, _ = s.db.Exec(ctx, `UPDATE assets SET status='failed' WHERE id=$1`, assetID)
-	_, _ = s.db.Exec(ctx, `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, reserved, spaceID)
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		slog.Error("mark upload failed", "upload_id", sessionID, "error", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+	result, err := tx.Exec(ctx, `UPDATE upload_sessions SET state='failed' WHERE id=$1 AND state IN ('pending','uploading','completing')`, sessionID)
+	if err == nil && result.RowsAffected() > 0 {
+		_, err = tx.Exec(ctx, `UPDATE assets SET status='failed' WHERE id=$1`, assetID)
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, reserved, spaceID)
+		}
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
+	}
+	if err != nil {
+		slog.Error("mark upload failed", "upload_id", sessionID, "error", err)
+	}
 }
 
 func (s *Server) getUpload(ctx context.Context, id, userID uuid.UUID) (uploadRecord, error) {
@@ -375,6 +391,10 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "upload_finalized", "已完成的上传不能继续签发分片")
 		return
 	}
+	if upload.State != "uploading" {
+		writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+		return
+	}
 	var input struct {
 		PartNumbers []int32 `json:"partNumbers"`
 	}
@@ -399,6 +419,48 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 		items = append(items, map[string]any{"partNumber": number, "url": url})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) resumeUpload(w http.ResponseWriter, r *http.Request) {
+	a := actorFrom(r)
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	upload, err := s.getUpload(r.Context(), id, a.UserID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
+		return
+	}
+	if upload.State == "ready" {
+		writeJSON(w, http.StatusOK, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "ready"})
+		return
+	}
+	if upload.State != "uploading" || upload.ExpiresAt.Before(time.Now()) {
+		writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+		return
+	}
+	response := map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "uploading", "method": upload.Method, "expiresAt": upload.ExpiresAt}
+	if upload.Method == "put" {
+		var mime string
+		if err := s.db.QueryRow(r.Context(), `SELECT mime_type FROM assets WHERE id=$1 AND status='pending'`, upload.AssetID).Scan(&mime); err != nil {
+			writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+			return
+		}
+		url, err := s.store.PresignPut(r.Context(), upload.ObjectKey, mime)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		response["url"] = url
+	} else {
+		if upload.UploadID == nil {
+			writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+			return
+		}
+		response["partSize"] = choosePartSize(upload.ExpectedSize)
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
@@ -452,9 +514,13 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	result, err := tx.Exec(r.Context(), `UPDATE upload_sessions SET state='ready' WHERE id=$1 AND state<>'ready'`, upload.ID)
+	result, err := tx.Exec(r.Context(), `UPDATE upload_sessions SET state='ready' WHERE id=$1 AND state='uploading'`, upload.ID)
 	if err != nil {
 		internalError(w, err)
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
 		return
 	}
 	if result.RowsAffected() > 0 {

@@ -23,11 +23,23 @@ export type ResumableUpload = { key: string; session: UploadSession; file: File;
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/v1";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
-    credentials: "include",
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-  });
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), 30_000);
+  const abort = () => controller.abort(init?.signal?.reason);
+  if (init?.signal?.aborted) abort();
+  else init?.signal?.addEventListener("abort", abort, { once: true });
+  const headers = new Headers(init?.headers);
+  if (init?.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  let response: Response;
+  try {
+    response = await fetch(`${apiBase}${path}`, { credentials: "include", ...init, headers, signal: controller.signal });
+  } catch (error) {
+    if (controller.signal.aborted && !init?.signal?.aborted) throw new Error("请求超时，请检查网络后重试");
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    init?.signal?.removeEventListener("abort", abort);
+  }
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     throw new Error(data?.error?.message || `请求失败 (${response.status})`);
@@ -45,9 +57,11 @@ function putBlob(
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", url);
+    xhr.timeout = 10 * 60 * 1000;
     xhr.setRequestHeader("Content-Type", contentType || "application/octet-stream");
     xhr.upload.onprogress = (event) => onProgress(event.loaded);
     xhr.onerror = () => reject(new Error("网络中断，请重试"));
+    xhr.ontimeout = () => reject(new Error("上传超时，请重试或暂停后继续"));
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         resolve(xhr.getResponseHeader("ETag") || "");
@@ -59,6 +73,10 @@ function putBlob(
       xhr.abort();
       reject(new DOMException("Paused", "AbortError"));
     };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
     signal.addEventListener("abort", abort, { once: true });
     xhr.onloadend = () => signal.removeEventListener("abort", abort);
     xhr.send(blob);
@@ -84,6 +102,7 @@ export async function clearResumeState(key: string) {
   if (!("indexedDB" in window)) return;
   await new Promise<void>((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("uploads");
     request.onerror = () => resolve();
     request.onsuccess = () => {
       const tx = request.result.transaction("uploads", "readwrite");
@@ -163,13 +182,14 @@ export async function uploadFile(
       mimeType: file.type || "application/octet-stream",
       conflictPolicy: "keep_both",
     }),
+    signal: options.signal,
   });
   const resumeKey = options.resumeKey || `${session.id}:${file.name}:${file.size}:${file.lastModified}`;
   await saveResumeState(resumeKey, { session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now() });
 
   if (session.method === "put") {
     await putBlob(session.url!, file, file.type, options.signal, (loaded) => options.onProgress(loaded / Math.max(1, file.size)));
-    await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }) });
+    await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }), signal: options.signal });
     await clearResumeState(resumeKey);
     options.onProgress(1);
     return session.nodeId;
@@ -189,6 +209,7 @@ export async function uploadFile(
     const signed = await api<{ items: { partNumber: number; url: string }[] }>(`/uploads/${session.id}/parts`, {
       method: "POST",
       body: JSON.stringify({ partNumbers: numbers }),
+      signal: options.signal,
     });
     for (let cursor = 0; cursor < signed.items.length; cursor += 4) {
       const group = signed.items.slice(cursor, cursor + 4);
@@ -200,6 +221,7 @@ export async function uploadFile(
             partProgress.set(partNumber, loaded);
             updateProgress();
           });
+          if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 MinIO CORS 配置");
           partProgress.set(partNumber, blob.size);
           return { partNumber, etag };
         }),
@@ -209,7 +231,7 @@ export async function uploadFile(
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);
-  await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }) });
+  await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }), signal: options.signal });
   await clearResumeState(resumeKey);
   options.onProgress(1);
   return session.nodeId;
@@ -220,10 +242,20 @@ export async function resumeMultipartUpload(
   signal: AbortSignal,
   onProgress: (value: number) => void,
 ) {
-  const { session, file, partSize, key } = resumable;
-  if (session.method === "put") {
-    await putBlob(session.url!, file, file.type, signal, (loaded) => onProgress(loaded / Math.max(1, file.size)));
-    await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }) });
+  const { session, file, key } = resumable;
+  const refreshed = await api<{ state: "uploading" | "ready"; nodeId: string; method?: "put" | "multipart"; url?: string; partSize?: number }>(`/uploads/${session.id}/resume`, { method: "POST", signal });
+  if (refreshed.state === "ready") {
+    await clearResumeState(key);
+    onProgress(1);
+    return;
+  }
+  const activeSession = { ...session, method: refreshed.method || session.method, url: refreshed.url || session.url, partSize: refreshed.partSize || session.partSize };
+  const partSize = activeSession.partSize || resumable.partSize;
+  await saveResumeState(key, { ...resumable, session: activeSession, partSize, updatedAt: Date.now() });
+  if (activeSession.method === "put") {
+    if (!activeSession.url) throw new Error("无法刷新上传地址，请重新选择文件");
+    await putBlob(activeSession.url, file, file.type, signal, (loaded) => onProgress(loaded / Math.max(1, file.size)));
+    await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }), signal });
     await clearResumeState(key);
     onProgress(1);
     return;
@@ -242,21 +274,22 @@ export async function resumeMultipartUpload(
   const missing = Array.from({ length: partCount }, (_, index) => index + 1).filter((number) => !completedNumbers.has(number));
   for (let start = 0; start < missing.length; start += 20) {
     const numbers = missing.slice(start, start + 20);
-    const signed = await api<{ items: { partNumber: number; url: string }[] }>(`/uploads/${session.id}/parts`, { method: "POST", body: JSON.stringify({ partNumbers: numbers }) });
+    const signed = await api<{ items: { partNumber: number; url: string }[] }>(`/uploads/${activeSession.id}/parts`, { method: "POST", body: JSON.stringify({ partNumbers: numbers }), signal });
     for (let cursor = 0; cursor < signed.items.length; cursor += 4) {
       const results = await Promise.all(signed.items.slice(cursor, cursor + 4).map(async ({ partNumber, url }) => {
         const offset = (partNumber - 1) * partSize;
         const blob = file.slice(offset, Math.min(file.size, offset + partSize));
         const etag = await putBlob(url, blob, file.type, signal, (loaded) => { partProgress.set(partNumber, loaded); updateProgress(); });
+        if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 MinIO CORS 配置");
         partProgress.set(partNumber, blob.size);
         return { partNumber, etag };
       }));
       completed.push(...results);
-      await saveResumeState(key, { session, file, parts: completed, partSize, updatedAt: Date.now() });
+      await saveResumeState(key, { session: activeSession, file, parts: completed, partSize, updatedAt: Date.now() });
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);
-  await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }) });
+  await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }), signal });
   await clearResumeState(key);
   onProgress(1);
 }

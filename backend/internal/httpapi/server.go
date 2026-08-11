@@ -92,6 +92,7 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 			r.Post("/upload-batches", s.createUploadBatch)
 			r.Post("/uploads", s.createUpload)
 			r.Post("/uploads/{id}/parts", s.presignParts)
+			r.Post("/uploads/{id}/resume", s.resumeUpload)
 			r.Post("/uploads/{id}/complete", s.completeUpload)
 			r.Delete("/uploads/{id}", s.abortUpload)
 			r.Get("/uploads", s.listUploads)
@@ -248,10 +249,14 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	if err := s.db.Ping(ctx); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "数据库尚未就绪")
+		return
+	}
+	if err := s.store.Ready(ctx); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "对象存储尚未就绪")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
