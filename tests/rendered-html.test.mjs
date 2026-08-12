@@ -39,6 +39,18 @@ test("starter preview is removed and production assets are present", async () =>
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
 });
 
+test("README documents core features and includes sanitized product screenshots", async () => {
+  const readme = await readFile(new URL("README.md", root), "utf8");
+  for (const image of ["files.png", "albums.png", "shares.png"]) {
+    await access(new URL(`docs/screenshots/${image}`, root));
+    assert.match(readme, new RegExp(`docs/screenshots/${image.replace(".", "\\.")}`));
+  }
+  assert.match(readme, /## 功能介绍/);
+  assert.match(readme, /### 文件与上传/);
+  assert.match(readme, /### 照片与相册/);
+  assert.match(readme, /### 分享、权限与账户/);
+});
+
 test("invite, reset, and public-share routes render", async () => {
   for (const path of ["/invite/test-token", "/reset-password/test-token", "/s/test-token"]) {
     const response = await render(path);
