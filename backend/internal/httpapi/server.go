@@ -97,6 +97,7 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 			r.Delete("/uploads/{id}", s.abortUpload)
 			r.Get("/uploads", s.listUploads)
 			r.Get("/nodes/{id}/download", s.downloadFile)
+			r.Get("/nodes/{id}/preview", s.previewFile)
 			r.Get("/nodes/{id}/archive", s.downloadArchive)
 			r.Get("/photos", s.listPhotos)
 			r.Patch("/photos/{id}", s.updatePhoto)

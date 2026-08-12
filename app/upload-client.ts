@@ -18,7 +18,7 @@ type UploadSession = {
 };
 
 type Part = { partNumber: number; etag: string };
-export type ResumableUpload = { key: string; session: UploadSession; file: File; parts: Part[]; partSize: number; updatedAt: number };
+export type ResumableUpload = { key: string; session: UploadSession; file: File; parts: Part[]; partSize: number; updatedAt: number; albumId?: string };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/v1";
 
@@ -127,7 +127,7 @@ export async function loadResumableUploads(): Promise<ResumableUpload[]> {
         if (!cursor.result) return;
         const value = cursor.result.value as Partial<ResumableUpload>;
         if (value.session && value.file instanceof File) {
-          results.push({ key: String(cursor.result.key), session: value.session, file: value.file, parts: value.parts || [], partSize: value.partSize || 16 * 1024 * 1024, updatedAt: value.updatedAt || 0 });
+          results.push({ key: String(cursor.result.key), session: value.session, file: value.file, parts: value.parts || [], partSize: value.partSize || 16 * 1024 * 1024, updatedAt: value.updatedAt || 0, albumId: value.albumId });
         }
         cursor.result.continue();
       };
@@ -165,6 +165,7 @@ export async function uploadFile(
     spaceId: string;
     parentId: string | null;
     batchId?: string;
+    albumId?: string;
     resumeKey?: string;
     signal: AbortSignal;
     onProgress: (value: number) => void;
@@ -185,7 +186,7 @@ export async function uploadFile(
     signal: options.signal,
   });
   const resumeKey = options.resumeKey || `${session.id}:${file.name}:${file.size}:${file.lastModified}`;
-  await saveResumeState(resumeKey, { session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now() });
+  await saveResumeState(resumeKey, { session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now(), albumId: options.albumId });
 
   if (session.method === "put") {
     await putBlob(session.url!, file, file.type, options.signal, (loaded) => options.onProgress(loaded / Math.max(1, file.size)));
@@ -227,7 +228,7 @@ export async function uploadFile(
         }),
       );
       completed.push(...results);
-      await saveResumeState(resumeKey, { session, file, parts: completed, partSize, updatedAt: Date.now() });
+      await saveResumeState(resumeKey, { session, file, parts: completed, partSize, updatedAt: Date.now(), albumId: options.albumId });
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);
@@ -247,7 +248,7 @@ export async function resumeMultipartUpload(
   if (refreshed.state === "ready") {
     await clearResumeState(key);
     onProgress(1);
-    return;
+    return refreshed.nodeId;
   }
   const activeSession = { ...session, method: refreshed.method || session.method, url: refreshed.url || session.url, partSize: refreshed.partSize || session.partSize };
   const partSize = activeSession.partSize || resumable.partSize;
@@ -258,7 +259,7 @@ export async function resumeMultipartUpload(
     await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }), signal });
     await clearResumeState(key);
     onProgress(1);
-    return;
+    return refreshed.nodeId;
   }
   const completed = [...resumable.parts];
   const completedNumbers = new Set(completed.map((part) => part.partNumber));
@@ -292,6 +293,7 @@ export async function resumeMultipartUpload(
   await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }), signal });
   await clearResumeState(key);
   onProgress(1);
+  return refreshed.nodeId;
 }
 
 export { api };

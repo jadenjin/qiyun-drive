@@ -481,6 +481,41 @@ func (s *Server) downloadFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"url": url, "expiresIn": int(s.cfg.PresignTTL.Seconds())})
 }
 
+func (s *Server) previewFile(w http.ResponseWriter, r *http.Request) {
+	a := actorFrom(r)
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	level, err := s.nodePermission(r.Context(), a, id)
+	if err != nil || level < permissionViewer {
+		writeError(w, http.StatusNotFound, "not_found", "文件不存在")
+		return
+	}
+	var name, key, mime string
+	if err := s.db.QueryRow(r.Context(), `SELECT n.name,a.object_key,a.mime_type FROM nodes n JOIN assets a ON a.id=n.asset_id WHERE n.id=$1 AND n.kind='file' AND n.deleted_at IS NULL AND a.status='ready'`, id).Scan(&name, &key, &mime); err != nil {
+		if !dbNotFound(w, err) {
+			internalError(w, err)
+		}
+		return
+	}
+	if !isPreviewableMIME(mime) {
+		writeError(w, http.StatusUnsupportedMediaType, "preview_unsupported", "此文件类型暂不支持在线预览")
+		return
+	}
+	url, err := s.store.PresignGet(r.Context(), key, "")
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "name": name, "mimeType": mime, "url": url, "expiresIn": int(s.cfg.PresignTTL.Seconds())})
+}
+
+func isPreviewableMIME(mime string) bool {
+	base := strings.ToLower(strings.TrimSpace(strings.Split(mime, ";")[0]))
+	return strings.HasPrefix(base, "image/") || strings.HasPrefix(base, "video/") || strings.HasPrefix(base, "audio/") || strings.HasPrefix(base, "text/") || base == "application/pdf"
+}
+
 type archiveEntry struct{ Name, Key string }
 
 func (s *Server) downloadArchive(w http.ResponseWriter, r *http.Request) {

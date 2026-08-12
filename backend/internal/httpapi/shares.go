@@ -147,6 +147,10 @@ func (s *Server) unlockShare(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "分享不存在或已失效")
 		return
 	}
+	if passwordHash != nil && input.Password == "" {
+		writeError(w, http.StatusPreconditionRequired, "password_required", "请输入访问密码")
+		return
+	}
 	if passwordHash != nil && !panAuth.VerifyPassword(*passwordHash, input.Password) {
 		writeError(w, http.StatusUnauthorized, "wrong_password", "访问密码错误")
 		return

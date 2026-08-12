@@ -58,6 +58,9 @@ test("drive UI uses real trash/share data and exposes folder and album uploads",
   assert.match(drive, /上传照片/);
   assert.match(drive, /`\/albums\/\$\{albumId\}\/items`/);
   assert.match(uploader, /return session\.nodeId/);
+  assert.match(uploader, /albumId\?: string/);
+  assert.match(uploader, /albumId: options\.albumId/);
+  assert.match(drive, /resumable\.albumId/);
 });
 
 test("drive UI exposes complete album, file-management, permission, and account flows", async () => {
@@ -75,6 +78,9 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(drive, /function MoveDialog/);
   assert.match(drive, /function PermissionDialog/);
   assert.match(drive, /function AccountDialog/);
+  assert.match(drive, /function FilePreviewDialog/);
+  assert.match(drive, /function ShareCreatedDialog/);
+  assert.match(drive, /文件排序方式/);
   assert.match(drive, /api<\{ items: Member\[\] \}>\("\/members"\)/);
   assert.match(drive, /最近活动/);
   assert.match(drive, /有效分享/);

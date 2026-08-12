@@ -95,3 +95,16 @@ func TestPasswordLengthHasUpperBound(t *testing.T) {
 		t.Fatalf("valid password rejected: %v", err)
 	}
 }
+
+func TestPreviewableMIMEAllowlist(t *testing.T) {
+	for _, mime := range []string{"image/png", "VIDEO/MP4", "audio/mpeg", "text/plain; charset=utf-8", "application/pdf"} {
+		if !isPreviewableMIME(mime) {
+			t.Errorf("expected %q to be previewable", mime)
+		}
+	}
+	for _, mime := range []string{"", "application/octet-stream", "application/zip", "application/pdfx"} {
+		if isPreviewableMIME(mime) {
+			t.Errorf("expected %q to be rejected", mime)
+		}
+	}
+}

@@ -1,17 +1,23 @@
 "use client";
 /* eslint-disable @next/next/no-img-element */
+/* User-owned media may not include a separate captions track. */
+/* eslint-disable jsx-a11y/media-has-caption */
 
 import {
   Archive,
   ArrowLeft,
+  ArrowUpDown,
   Bell,
   Camera,
   ChevronDown,
   ChevronRight,
   Clock3,
   Cloud,
+  Copy,
   Download,
   Edit3,
+  Eye,
+  ExternalLink,
   File,
   FileArchive,
   FileImage,
@@ -64,6 +70,7 @@ type FolderOption = { id: string; parentId?: string; name: string; permission: s
 type PermissionEntry = { userId: string; username?: string; displayName?: string; permission: "none" | "viewer" | "editor" | "manager" };
 type PermissionEditorState = { resourceType: "node" | "album"; id: string; name: string; inherit: boolean; entries: PermissionEntry[] };
 type AuditItem = { id: string; action: string; resourceType?: string; resourceId?: string; metadata: string; actorName?: string; createdAt: string };
+type FilePreviewState = { item: NodeItem; url: string; mimeType: string };
 
 const previewSpaces: Space[] = [
   { id: "personal", kind: "personal", name: "陈谨的空间", quotaBytes: 500 * 1024 ** 3, usedBytes: 128.6 * 1024 ** 3, reservedBytes: 0, permission: "manager" },
@@ -145,6 +152,7 @@ export function CloudDrive() {
   const [selectedAlbum, setSelectedAlbum] = useState<Album | null>(null);
   const [albumPhotos, setAlbumPhotos] = useState<PhotoItem[]>([]);
   const [photoViewer, setPhotoViewer] = useState<{ photo: PhotoItem; albumId?: string } | null>(null);
+  const [filePreview, setFilePreview] = useState<FilePreviewState | null>(null);
   const [albumEditor, setAlbumEditor] = useState<Album | null>(null);
   const [nodeEditor, setNodeEditor] = useState<NodeItem | null>(null);
   const [members, setMembers] = useState<Member[]>([
@@ -164,6 +172,7 @@ export function CloudDrive() {
   const [shares, setShares] = useState<ShareItem[]>([]);
   const [trashNodes, setTrashNodes] = useState<TrashItem[]>([]);
   const [shareTarget, setShareTarget] = useState<{ id: string; kind: "file" | "folder" | "album"; name: string } | null>(null);
+  const [createdShareURL, setCreatedShareURL] = useState("");
   const [currentParent, setCurrentParent] = useState<string | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<{ id: string | null; name: string }[]>([{ id: null, name: "我的空间" }]);
   const [grid, setGrid] = useState(false);
@@ -281,7 +290,14 @@ export function CloudDrive() {
       await Promise.all(pending.map(async (item) => {
         const controller = new AbortController();
         try {
-          await resumeMultipartUpload(item, controller.signal, (progress) => setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress } : task)));
+          const nodeId = await resumeMultipartUpload(item, controller.signal, (progress) => setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress } : task)));
+          if (item.albumId && nodeId) {
+            try {
+              await api(`/albums/${item.albumId}/items`, { method: "POST", body: JSON.stringify({ nodeIds: [nodeId] }) });
+            } catch {
+              // The upload itself is complete even if the original album was removed meanwhile.
+            }
+          }
           setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress: 1, state: "ready" } : task));
         } catch (error) {
           const message = error instanceof Error ? error.message : "恢复上传失败";
@@ -302,6 +318,8 @@ export function CloudDrive() {
     setView(next);
     setSelectedAlbum(null);
     setPhotoViewer(null);
+    setFilePreview(null);
+    setCreatedShareURL("");
     setMenuOpen(false);
     setAccountOpen(false);
     setNotificationsOpen(false);
@@ -334,6 +352,7 @@ export function CloudDrive() {
     setView("files");
     setSelectedAlbum(null);
     setPhotoViewer(null);
+    setFilePreview(null);
   };
 
   const updateProfile = async (displayName: string) => {
@@ -358,6 +377,19 @@ export function CloudDrive() {
     if (item.kind !== "folder") return;
     setCurrentParent(item.id);
     setBreadcrumbs((items) => [...items, { id: item.id, name: item.name }]);
+  };
+
+  const openNode = async (item: NodeItem) => {
+    if (item.kind === "folder") {
+      openFolder(item);
+      return;
+    }
+    try {
+      const preview = await api<{ url: string; mimeType: string }>(`/nodes/${item.id}/preview`);
+      setFilePreview({ item, url: preview.url, mimeType: preview.mimeType || item.mimeType });
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "无法预览此文件");
+    }
   };
 
   const goBreadcrumb = (index: number) => {
@@ -406,7 +438,7 @@ export function CloudDrive() {
         uploadControllers.current.set(task.id, controller);
         setUploads((items) => items.map((item) => item.id === task.id ? { ...item, state: "uploading" } : item));
         try {
-          const nodeId = await uploadFile(file, { spaceId, parentId: currentParent, batchId, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
+          const nodeId = await uploadFile(file, { spaceId, parentId: currentParent, batchId, albumId, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
           uploadedNodeIds.push(nodeId);
           setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress: 1, state: "ready" } : item));
         } catch (error) {
@@ -513,7 +545,15 @@ export function CloudDrive() {
     uploadControllers.current.set(taskId, controller);
     setUploads((items) => items.map((item) => item.id === taskId ? { ...item, state: "uploading", error: undefined } : item));
     try {
-      await resumeMultipartUpload(resumable, controller.signal, (progress) => setUploads((items) => items.map((item) => item.id === taskId ? { ...item, progress } : item)));
+      const nodeId = await resumeMultipartUpload(resumable, controller.signal, (progress) => setUploads((items) => items.map((item) => item.id === taskId ? { ...item, progress } : item)));
+      if (resumable.albumId && nodeId) {
+        try {
+          await api(`/albums/${resumable.albumId}/items`, { method: "POST", body: JSON.stringify({ nodeIds: [nodeId] }) });
+          if (selectedAlbum?.id === resumable.albumId) await loadAlbumItems(resumable.albumId);
+        } catch {
+          showToast("文件已上传，但原相册不可用，已保留在文件中");
+        }
+      }
       setUploads((items) => items.map((item) => item.id === taskId ? { ...item, progress: 1, state: "ready" } : item));
       await refreshView();
     } catch (error) {
@@ -608,20 +648,37 @@ export function CloudDrive() {
   const createShareLink = async (options: { password: string; days: number; allowDownload: boolean }) => {
     if (!shareTarget) return;
     if (status === "preview") {
-      await navigator.clipboard?.writeText("https://cloud.example/s/preview-link");
-      showToast("分享链接已复制（界面预览）");
+      setCreatedShareURL("https://cloud.example/s/preview-link");
       setShareTarget(null);
       return;
     }
     try {
       const expiresAt = options.days > 0 ? new Date(Date.now() + options.days * 86400000).toISOString() : null;
-      const result = await api<{ url: string }>("/shares", { method: "POST", body: JSON.stringify({ resourceType: shareTarget.kind, resourceId: shareTarget.id, password: options.password, expiresAt, allowDownload: options.allowDownload }) });
-      await navigator.clipboard.writeText(result.url);
-      showToast("分享链接已创建并复制；请妥善保存")
+      const result = await api<{ id: string; url: string }>("/shares", { method: "POST", body: JSON.stringify({ resourceType: shareTarget.kind, resourceId: shareTarget.id, password: options.password, expiresAt, allowDownload: options.allowDownload }) });
+      setCreatedShareURL(result.url);
       setShareTarget(null);
-      const updated = await api<{ items: ShareItem[] }>("/shares");
-      setShares(updated.items);
+      try {
+        const updated = await api<{ items: ShareItem[] }>("/shares");
+        setShares(updated.items);
+      } catch {
+        setShares((items) => [...items, { id: result.id, resourceType: shareTarget.kind, resourceId: shareTarget.id, resourceName: shareTarget.name, hasPassword: Boolean(options.password), allowDownload: options.allowDownload, expiresAt: expiresAt || undefined, createdAt: new Date().toISOString() }]);
+      }
+      try {
+        await navigator.clipboard.writeText(result.url);
+        showToast("分享链接已创建并复制");
+      } catch {
+        showToast("分享链接已创建，请在窗口中手动复制");
+      }
     } catch (error) { showToast(error instanceof Error ? error.message : "创建分享失败"); }
+  };
+
+  const copyCreatedShare = async () => {
+    try {
+      await navigator.clipboard.writeText(createdShareURL);
+      showToast("分享链接已复制");
+    } catch {
+      showToast("无法访问剪贴板，请选中链接手动复制");
+    }
   };
 
   const revokeShare = async (id: string) => {
@@ -721,7 +778,7 @@ export function CloudDrive() {
           <input ref={fileInput} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={(node) => { folderInput.current = node; if (node) node.setAttribute("webkitdirectory", ""); }} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={albumInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handleAlbumPhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
-          {view === "files" && <FileView items={filteredNodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={openFolder} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
+          {view === "files" && <FileView items={filteredNodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={(item) => void openNode(item)} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
           {view === "photos" && <PhotoView photos={filteredPhotos} onOpen={(photo) => setPhotoViewer({ photo })} />}
           {view === "albums" && (selectedAlbum ? <AlbumDetail album={selectedAlbum} photos={albumPhotos.filter((item) => `${item.name} ${item.remark}`.toLowerCase().includes(search.toLowerCase()))} onBack={() => { setSelectedAlbum(null); setAlbumPhotos([]); }} onUpload={chooseAlbumPhotos} onOpen={(photo) => setPhotoViewer({ photo, albumId: selectedAlbum.id })} onEdit={setAlbumEditor} onPermissions={selectedSpace?.kind === "family" && selectedAlbum.permission === "manager" ? (album) => void openPermissionEditor("album", album.id, album.name) : undefined} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} onDelete={deleteAlbum} /> : <AlbumView albums={filteredAlbums} onOpen={openAlbum} onUpload={chooseAlbumPhotos} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} />)}
           {view === "shares" && <ShareView shares={status === "preview" ? undefined : shares} onRevoke={revokeShare} />}
@@ -730,10 +787,12 @@ export function CloudDrive() {
         </div>
       </main>
       <div className="mobile-nav">{navItems.slice(0, 4).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => changeView(item.id)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
-      {uploads.length > 0 && <UploadTray tasks={uploads} onClose={() => setUploads([])} onPause={(id) => uploadControllers.current.get(id)?.abort()} onResume={resumeTask} />}
+      {uploads.length > 0 && <UploadTray tasks={uploads} onClose={() => setUploads((items) => items.filter((item) => item.state !== "ready"))} onPause={(id) => uploadControllers.current.get(id)?.abort()} onResume={resumeTask} />}
       {dialog && <NameDialog type={dialog} onClose={() => setDialog(null)} onSubmit={createNamedItem} onInvite={async (role) => { if (status === "preview") { showToast("邀请链接已复制（界面预览）"); setDialog(null); return; } try { const result = await api<{ url: string }>("/invitations", { method: "POST", body: JSON.stringify({ role }) }); await navigator.clipboard.writeText(result.url); showToast("邀请链接已复制"); setDialog(null); } catch (error) { showToast(error instanceof Error ? error.message : "邀请失败"); } }} />}
       {shareTarget && <ShareDialog target={shareTarget} onClose={() => setShareTarget(null)} onSubmit={createShareLink} />}
+      {createdShareURL && <ShareCreatedDialog url={createdShareURL} onClose={() => setCreatedShareURL("")} onCopy={copyCreatedShare} />}
       {photoViewer && <PhotoViewer photo={photoViewer.photo} onClose={() => setPhotoViewer(null)} onSave={(remark) => savePhotoRemark(photoViewer.photo, remark)} onDownload={() => downloadPhoto(photoViewer.photo)} onRemove={photoViewer.albumId ? () => removePhotoFromAlbum(photoViewer.albumId!, photoViewer.photo.nodeId) : undefined} />}
+      {filePreview && <FilePreviewDialog value={filePreview} onClose={() => setFilePreview(null)} onDownload={() => downloadNode(filePreview.item)} />}
       {albumEditor && <AlbumEditDialog album={albumEditor} onClose={() => setAlbumEditor(null)} onSubmit={(values) => updateAlbum(albumEditor, values)} />}
       {nodeEditor && <RenameDialog item={nodeEditor} onClose={() => setNodeEditor(null)} onSubmit={(name) => renameNode(nodeEditor, name)} />}
       {moveEditor && <MoveDialog items={moveEditor.items} folders={moveEditor.folders} rootName={selectedSpace?.name || "空间根目录"} onClose={() => setMoveEditor(null)} onSubmit={(parentId) => moveNodes(moveEditor.items, parentId)} />}
@@ -748,13 +807,27 @@ export function CloudDrive() {
 
 function FileView({ items, grid, onGrid, breadcrumbs, onBreadcrumb, onOpen, onDownload, onRename, onMove, onTrash, onBatchTrash, onPermissions, canManagePermissions, onShare, onUploadFolder }: { items: NodeItem[]; grid: boolean; onGrid: (value: boolean) => void; breadcrumbs: { id: string | null; name: string }[]; onBreadcrumb: (index: number) => void; onOpen: (item: NodeItem) => void; onDownload: (item: NodeItem) => void; onRename: (item: NodeItem) => void; onMove: (items: NodeItem[]) => void; onTrash: (item: NodeItem) => void; onBatchTrash: (items: NodeItem[]) => void; onPermissions: (item: NodeItem) => void; canManagePermissions: boolean; onShare: (item: NodeItem) => void; onUploadFolder: () => void }) {
   const [selected, setSelected] = useState<string[]>([]);
-  const visibleSelected = items.filter((item) => selected.includes(item.id));
+  const [sortKey, setSortKey] = useState<"name" | "size" | "updated">("name");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+  const orderedItems = useMemo(() => [...items].sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === "folder" ? -1 : 1;
+    let compared = 0;
+    if (sortKey === "size") compared = left.sizeBytes - right.sizeBytes;
+    else if (sortKey === "updated") compared = new Date(left.updatedAt).getTime() - new Date(right.updatedAt).getTime();
+    else compared = left.name.localeCompare(right.name, "zh-CN", { numeric: true, sensitivity: "base" });
+    return sortDirection === "asc" ? compared : -compared;
+  }), [items, sortDirection, sortKey]);
+  const changeSort = (next: "name" | "size" | "updated") => {
+    if (sortKey === next) setSortDirection((current) => current === "asc" ? "desc" : "asc");
+    else { setSortKey(next); setSortDirection(next === "name" ? "asc" : "desc"); }
+  };
+  const visibleSelected = orderedItems.filter((item) => selected.includes(item.id));
   const toggleSelected = (id: string) => setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
-  const allSelected = items.length > 0 && items.every((item) => selected.includes(item.id));
+  const allSelected = orderedItems.length > 0 && orderedItems.every((item) => selected.includes(item.id));
   return <section className="surface-card file-surface">
-    <div className="file-toolbar"><div className="breadcrumbs">{breadcrumbs.map((item, index) => <span key={`${item.id}-${index}`}><button onClick={() => { setSelected([]); onBreadcrumb(index); }}>{item.name}</button>{index < breadcrumbs.length - 1 && <ChevronRight size={14} />}</span>)}</div><div className="view-toggle"><button onClick={() => setSelected(allSelected ? [] : items.map((item) => item.id))} title={allSelected ? "取消全选" : "全选"}>{allSelected ? <CheckSquare size={16} /> : <Square size={16} />}</button><button onClick={onUploadFolder} title="上传文件夹"><UploadCloud size={16} /></button><button className={!grid ? "active" : ""} onClick={() => onGrid(false)} aria-label="列表视图"><List size={17} /></button><button className={grid ? "active" : ""} onClick={() => onGrid(true)} aria-label="网格视图"><Grid2X2 size={16} /></button></div></div>
+    <div className="file-toolbar"><div className="breadcrumbs">{breadcrumbs.map((item, index) => <span key={`${item.id}-${index}`}><button onClick={() => { setSelected([]); onBreadcrumb(index); }}>{item.name}</button>{index < breadcrumbs.length - 1 && <ChevronRight size={14} />}</span>)}</div><div className="view-toggle"><label className="sort-picker"><span>排序</span><select value={sortKey} onChange={(event) => { const next = event.target.value as "name" | "size" | "updated"; setSortKey(next); setSortDirection(next === "name" ? "asc" : "desc"); }} aria-label="文件排序方式"><option value="name">名称</option><option value="size">大小</option><option value="updated">更新时间</option></select></label><button onClick={() => changeSort(sortKey)} title={`当前按${sortKey === "name" ? "名称" : sortKey === "size" ? "大小" : "更新时间"}${sortDirection === "asc" ? "升序" : "降序"}`} aria-label="切换排序方向"><ArrowUpDown size={16} /></button><button onClick={() => setSelected(allSelected ? [] : orderedItems.map((item) => item.id))} title={allSelected ? "取消全选" : "全选"}>{allSelected ? <CheckSquare size={16} /> : <Square size={16} />}</button><button onClick={onUploadFolder} title="上传文件夹"><UploadCloud size={16} /></button><button className={!grid ? "active" : ""} onClick={() => onGrid(false)} aria-label="列表视图"><List size={17} /></button><button className={grid ? "active" : ""} onClick={() => onGrid(true)} aria-label="网格视图"><Grid2X2 size={16} /></button></div></div>
     {visibleSelected.length > 0 && <div className="selection-toolbar"><strong>已选 {visibleSelected.length} 项</strong><button onClick={() => onMove(visibleSelected)}><FolderInput size={15} /> 移动</button><button className="danger-text" onClick={() => onBatchTrash(visibleSelected)}><Trash2 size={15} /> 移到回收站</button><button onClick={() => setSelected([])}>取消选择</button></div>}
-    {grid ? <div className="file-grid">{items.map((item) => <article className={`file-tile ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><button className="tile-select" onClick={() => toggleSelected(item.id)} aria-label={`${selected.includes(item.id) ? "取消选择" : "选择"} ${item.name}`}>{selected.includes(item.id) ? <CheckSquare size={17} /> : <Square size={17} />}</button><button className="file-tile-main" onDoubleClick={() => onOpen(item)} onClick={() => item.kind === "folder" && onOpen(item)}><span className={`file-icon large ${item.kind}`}>{fileIcon(item)}</span><strong>{item.name}</strong><small>{item.kind === "folder" ? "文件夹" : formatBytes(item.sizeBytes)} · {relativeDate(item.updatedAt)}</small></button><span className="tile-actions"><button onClick={() => onDownload(item)} aria-label={`下载 ${item.name}`}><Download size={15} /></button><button onClick={() => onMove([item])} aria-label={`移动 ${item.name}`}><FolderInput size={15} /></button><button onClick={() => onRename(item)} aria-label={`重命名 ${item.name}`}><Edit3 size={15} /></button>{canManagePermissions && item.permission === "manager" && <button onClick={() => onPermissions(item)} aria-label={`设置 ${item.name} 权限`}><ShieldCheck size={15} /></button>}<button onClick={() => onShare(item)} aria-label={`分享 ${item.name}`}><Share2 size={15} /></button><button onClick={() => onTrash(item)} aria-label={`删除 ${item.name}`}><Trash2 size={15} /></button></span></article>)}</div> : <div className="file-list"><div className="file-row table-head"><span>名称</span><span>大小</span><span>更新时间</span><span /></div>{items.map((item) => <div className={`file-row ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><button className="file-name" onDoubleClick={() => onOpen(item)} onClick={() => item.kind === "folder" && onOpen(item)}><span className={`file-icon ${item.kind}`}>{fileIcon(item)}</span><span><strong>{item.name}</strong><small>{item.kind === "folder" ? "文件夹" : item.mimeType?.split("/")[1]?.toUpperCase()}</small></span></button><span>{item.kind === "folder" ? "—" : formatBytes(item.sizeBytes)}</span><span>{relativeDate(item.updatedAt)}</span><span className="row-actions"><button onClick={() => toggleSelected(item.id)} aria-label={`${selected.includes(item.id) ? "取消选择" : "选择"} ${item.name}`}>{selected.includes(item.id) ? <CheckSquare size={17} /> : <Square size={17} />}</button><button onClick={() => onDownload(item)} aria-label={`下载 ${item.name}`}><Download size={17} /></button><button onClick={() => onMove([item])} aria-label={`移动 ${item.name}`}><FolderInput size={16} /></button><button onClick={() => onRename(item)} aria-label={`重命名 ${item.name}`}><Edit3 size={16} /></button>{canManagePermissions && item.permission === "manager" && <button onClick={() => onPermissions(item)} aria-label={`设置 ${item.name} 权限`}><ShieldCheck size={16} /></button>}<button onClick={() => onShare(item)} aria-label={`分享 ${item.name}`}><Share2 size={17} /></button><button onClick={() => onTrash(item)} aria-label={`删除 ${item.name}`}><Trash2 size={16} /></button></span></div>)}{!items.length && <EmptyState icon={FolderOpen} title="这里还没有文件" text="上传文件或整个文件夹，开始整理你的空间" />}</div>}
+    {grid ? <div className="file-grid">{orderedItems.map((item) => <article className={`file-tile ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><button className="tile-select" onClick={() => toggleSelected(item.id)} aria-label={`${selected.includes(item.id) ? "取消选择" : "选择"} ${item.name}`}>{selected.includes(item.id) ? <CheckSquare size={17} /> : <Square size={17} />}</button><button className="file-tile-main" onClick={() => onOpen(item)}><span className={`file-icon large ${item.kind}`}>{fileIcon(item)}</span><strong>{item.name}</strong><small>{item.kind === "folder" ? "文件夹" : formatBytes(item.sizeBytes)} · {relativeDate(item.updatedAt)}</small></button><span className="tile-actions">{item.kind === "file" && <button onClick={() => onOpen(item)} aria-label={`预览 ${item.name}`}><Eye size={15} /></button>}<button onClick={() => onDownload(item)} aria-label={`下载 ${item.name}`}><Download size={15} /></button><button onClick={() => onMove([item])} aria-label={`移动 ${item.name}`}><FolderInput size={15} /></button><button onClick={() => onRename(item)} aria-label={`重命名 ${item.name}`}><Edit3 size={15} /></button>{canManagePermissions && item.permission === "manager" && <button onClick={() => onPermissions(item)} aria-label={`设置 ${item.name} 权限`}><ShieldCheck size={15} /></button>}<button onClick={() => onShare(item)} aria-label={`分享 ${item.name}`}><Share2 size={15} /></button><button onClick={() => onTrash(item)} aria-label={`删除 ${item.name}`}><Trash2 size={15} /></button></span></article>)}</div> : <div className="file-list"><div className="file-row table-head"><button className={sortKey === "name" ? "active" : ""} onClick={() => changeSort("name")}>名称 <ArrowUpDown size={13} /></button><button className={sortKey === "size" ? "active" : ""} onClick={() => changeSort("size")}>大小 <ArrowUpDown size={13} /></button><button className={sortKey === "updated" ? "active" : ""} onClick={() => changeSort("updated")}>更新时间 <ArrowUpDown size={13} /></button><span /></div>{orderedItems.map((item) => <div className={`file-row ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><button className="file-name" onClick={() => onOpen(item)}><span className={`file-icon ${item.kind}`}>{fileIcon(item)}</span><span><strong>{item.name}</strong><small>{item.kind === "folder" ? "文件夹" : item.mimeType?.split("/")[1]?.toUpperCase()}</small></span></button><span>{item.kind === "folder" ? "—" : formatBytes(item.sizeBytes)}</span><span>{relativeDate(item.updatedAt)}</span><span className="row-actions"><button onClick={() => toggleSelected(item.id)} aria-label={`${selected.includes(item.id) ? "取消选择" : "选择"} ${item.name}`}>{selected.includes(item.id) ? <CheckSquare size={17} /> : <Square size={17} />}</button>{item.kind === "file" && <button onClick={() => onOpen(item)} aria-label={`预览 ${item.name}`}><Eye size={16} /></button>}<button onClick={() => onDownload(item)} aria-label={`下载 ${item.name}`}><Download size={17} /></button><button onClick={() => onMove([item])} aria-label={`移动 ${item.name}`}><FolderInput size={16} /></button><button onClick={() => onRename(item)} aria-label={`重命名 ${item.name}`}><Edit3 size={16} /></button>{canManagePermissions && item.permission === "manager" && <button onClick={() => onPermissions(item)} aria-label={`设置 ${item.name} 权限`}><ShieldCheck size={16} /></button>}<button onClick={() => onShare(item)} aria-label={`分享 ${item.name}`}><Share2 size={17} /></button><button onClick={() => onTrash(item)} aria-label={`删除 ${item.name}`}><Trash2 size={16} /></button></span></div>)}{!orderedItems.length && <EmptyState icon={FolderOpen} title="这里还没有文件" text="上传文件或整个文件夹，开始整理你的空间" />}</div>}
   </section>;
 }
 
@@ -835,12 +908,24 @@ function FamilyView({ members, auditItems, space, canManage, canEditRoles, canEd
 
 function UploadTray({ tasks, onClose, onPause, onResume }: { tasks: UploadTask[]; onClose: () => void; onPause: (id: string) => void; onResume: (id: string) => void }) {
   const done = tasks.filter((item) => item.state === "ready").length;
-  return <aside className="upload-tray"><div className="upload-title"><span><UploadCloud size={18} /> 上传任务 <small>{done}/{tasks.length}</small></span><button onClick={onClose}><X size={17} /></button></div><div className="upload-items">{tasks.slice(0, 8).map((task) => <div className="upload-item" key={task.id}><span className="file-icon"><File size={16} /></span><span><strong>{task.name}</strong><small>{task.state === "ready" ? "上传完成" : task.state === "failed" ? task.error : task.state === "paused" ? "已暂停，可继续上传" : `${Math.round(task.progress * 100)}% · ${formatBytes(task.size)}`}</small><span className={`upload-progress ${task.state}`}><i style={{ width: `${task.progress * 100}%` }} /></span></span>{task.state === "uploading" && <button className="upload-control" onClick={() => onPause(task.id)} aria-label="暂停上传"><Pause size={15} /></button>}{task.state === "paused" && <button className="upload-control" onClick={() => onResume(task.id)} aria-label="继续上传"><Play size={15} /></button>}</div>)}</div></aside>;
+  return <aside className="upload-tray"><div className="upload-title"><span><UploadCloud size={18} /> 上传任务 <small>{done}/{tasks.length}</small></span><button onClick={onClose} disabled={!done} aria-label="清除已完成上传" title={done ? "清除已完成" : "上传完成后可清除"}><X size={17} /></button></div><div className="upload-items">{tasks.slice(0, 8).map((task) => <div className="upload-item" key={task.id}><span className="file-icon"><File size={16} /></span><span><strong>{task.name}</strong><small>{task.state === "ready" ? "上传完成" : task.state === "failed" ? task.error : task.state === "paused" ? "已暂停，可继续上传" : `${Math.round(task.progress * 100)}% · ${formatBytes(task.size)}`}</small><span className={`upload-progress ${task.state}`}><i style={{ width: `${task.progress * 100}%` }} /></span></span>{task.state === "uploading" && <button className="upload-control" onClick={() => onPause(task.id)} aria-label="暂停上传"><Pause size={15} /></button>}{(task.state === "paused" || task.state === "failed") && <button className="upload-control" onClick={() => onResume(task.id)} aria-label={task.state === "failed" ? "重试上传" : "继续上传"}><Play size={15} /></button>}</div>)}</div></aside>;
 }
 
 function PhotoViewer({ photo, onClose, onSave, onDownload, onRemove }: { photo: PhotoItem; onClose: () => void; onSave: (remark: string) => void; onDownload: () => void; onRemove?: () => void }) {
   const [remark, setRemark] = useState(photo.remark || "");
   return <div className="photo-viewer" role="dialog" aria-modal="true" aria-label={`查看照片 ${photo.name}`}><div className="photo-viewer-stage">{photo.previewUrl || photo.thumbUrl ? <img src={photo.previewUrl || photo.thumbUrl} alt={photo.remark || photo.name} /> : <div className="photo-viewer-fallback"><ImageIcon size={42} /> 暂无预览</div>}<button className="photo-viewer-close" onClick={onClose} aria-label="关闭照片"><X size={21} /></button></div><aside className="photo-inspector"><div><small>照片详情</small><h2>{photo.name}</h2><p>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "long", timeStyle: "short" }).format(new Date(photo.takenAt || photo.createdAt))}</p>{(photo.width || photo.height || photo.camera) && <p>{photo.width && photo.height ? `${photo.width} × ${photo.height}` : ""}{photo.camera ? ` · ${photo.camera}` : ""}</p>}</div><label>照片备注<textarea value={remark} onChange={(event) => setRemark(event.target.value)} maxLength={2000} placeholder="写下这张照片背后的故事…" /></label><div className="photo-inspector-actions"><button onClick={onDownload}><Download size={16} /> 下载原图</button>{onRemove && <button className="danger-text" onClick={onRemove}><Trash2 size={16} /> 从相册移除</button>}<button className="primary-button" onClick={() => onSave(remark.trim())}><Save size={16} /> 保存备注</button></div></aside></div>;
+}
+
+function FilePreviewDialog({ value, onClose, onDownload }: { value: FilePreviewState; onClose: () => void; onDownload: () => void }) {
+  const mime = value.mimeType.toLowerCase().split(";")[0];
+  const content = mime.startsWith("image/")
+    ? <img src={value.url} alt={value.item.name} />
+    : mime.startsWith("video/")
+      ? <video src={value.url} controls />
+      : mime.startsWith("audio/")
+        ? <div className="audio-preview"><File size={42} /><strong>{value.item.name}</strong><audio src={value.url} controls /></div>
+        : <iframe src={value.url} title={`预览 ${value.item.name}`} />;
+  return <div className="file-preview" role="dialog" aria-modal="true" aria-label={`预览文件 ${value.item.name}`}><header><span><Eye size={18} /><strong>{value.item.name}</strong><small>{value.mimeType}</small></span><span><button onClick={onDownload}><Download size={16} /> 下载</button><button onClick={onClose} aria-label="关闭文件预览"><X size={19} /></button></span></header><div className="file-preview-stage">{content}</div></div>;
 }
 
 function AlbumEditDialog({ album, onClose, onSubmit }: { album: Album; onClose: () => void; onSubmit: (values: { name: string; description: string }) => void }) {
@@ -921,6 +1006,10 @@ function ShareDialog({ target, onClose, onSubmit }: { target: { name: string }; 
   const [days, setDays] = useState(7);
   const [allowDownload, setAllowDownload] = useState(true);
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={(event) => { event.preventDefault(); onSubmit({ password, days, allowDownload }); }}><div className="modal-icon"><Share2 size={22} /></div><h2>分享「{target.name}」</h2><p>链接创建后只展示一次；复制给需要访问的人。</p><label className="modal-label">访问密码（可选）<input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="留空则无需密码" /></label><label className="modal-label">有效期<select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={1}>1 天</option><option value={7}>7 天</option><option value={30}>30 天</option><option value={0}>长期有效</option></select></label><label className="checkbox-label"><input type="checkbox" checked={allowDownload} onChange={(event) => setAllowDownload(event.target.checked)} />允许下载原文件</label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">创建并复制链接</button></div></form></div>;
+}
+
+function ShareCreatedDialog({ url, onClose, onCopy }: { url: string; onClose: () => void; onCopy: () => void }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal share-created" role="dialog" aria-modal="true" aria-label="分享链接已创建"><div className="modal-icon"><Link2 size={22} /></div><h2>分享链接已创建</h2><p>出于安全考虑，这条链接只在这里展示一次。请复制保存后再关闭。</p><label className="modal-label">分享链接<input value={url} readOnly onFocus={(event) => event.currentTarget.select()} /></label><div className="share-created-actions"><button type="button" onClick={onCopy}><Copy size={16} /> 复制链接</button><a className="primary-button" href={url} target="_blank" rel="noreferrer"><ExternalLink size={16} /> 打开验证</a></div><div className="modal-actions"><button type="button" onClick={onClose}>完成</button></div></section></div>;
 }
 
 function NameDialog({ type, onClose, onSubmit, onInvite }: { type: "folder" | "album" | "invite"; onClose: () => void; onSubmit: (name: string) => void; onInvite: (role: "member" | "admin") => void }) {

@@ -3,7 +3,7 @@
 
 import { Archive, ChevronRight, Cloud, Download, File, Folder, Image as ImageIcon, LockKeyhole, ShieldCheck, UserPlus } from "lucide-react";
 import Link from "next/link";
-import { FormEvent, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import { api } from "./upload-client";
 
 export function InviteAccept({ token }: { token: string }) {
@@ -38,18 +38,31 @@ export function PublicShare({ token }: { token: string }) {
   const [password, setPassword] = useState("");
   const [data, setData] = useState<ShareData | null>(null);
   const [error, setError] = useState("");
-  const unlock = async (event: FormEvent) => {
-    event.preventDefault();
+  const [loading, setLoading] = useState(true);
+  const openShare = useCallback(async (passwordValue: string, silent = false) => {
+    setLoading(true);
     try {
-      const unlocked = await api<{ accessToken: string }>(`/public/shares/${token}/unlock`, { method: "POST", body: JSON.stringify({ password }) });
+      const unlocked = await api<{ accessToken: string }>(`/public/shares/${token}/unlock`, { method: "POST", body: JSON.stringify({ password: passwordValue }) });
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_BASE || "/api/v1"}/public/shares/${token}`, { headers: { Authorization: `Bearer ${unlocked.accessToken}` } });
       if (!response.ok) throw new Error("分享内容已经失效");
       const share = await response.json() as ShareData;
-      if (share.archiveUrl) share.archiveUrl += `${share.archiveUrl.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(unlocked.accessToken)}`;
       setData(share);
-    } catch (value) { setError(value instanceof Error ? value.message : "无法打开分享"); }
+      setError("");
+    } catch (value) {
+      const message = value instanceof Error ? value.message : "无法打开分享";
+      if (!silent || message !== "请输入访问密码") setError(message);
+    } finally { setLoading(false); }
+  }, [token]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void openShare("", true); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [openShare]);
+  const unlock = async (event: FormEvent) => {
+    event.preventDefault();
+    await openShare(password);
   };
-  if (!data) return <TokenShell icon={<LockKeyhole size={25} />} title="打开栖云分享" subtitle="输入分享密码；未设置密码时直接继续即可。"><form onSubmit={unlock}><label>访问密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="分享密码（可留空）" /></label><button className="auth-submit">查看分享 <ChevronRight size={18} /></button>{error && <p className="auth-error">{error}</p>}</form></TokenShell>;
+  if (loading && !data) return <TokenShell icon={<ShieldCheck size={25} />} title="正在安全打开分享" subtitle="正在验证链接并获取内容，请稍候。"><div className="token-loading" aria-live="polite">正在加载…</div></TokenShell>;
+  if (!data) return <TokenShell icon={<LockKeyhole size={25} />} title="打开栖云分享" subtitle="此分享需要访问密码。"><form onSubmit={unlock}><label>访问密码<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="请输入分享密码" /></label><button className="auth-submit" disabled={loading}>查看分享 <ChevronRight size={18} /></button>{error && <p className="auth-error">{error}</p>}</form></TokenShell>;
   const KindIcon = data.resourceType === "album" ? ImageIcon : data.resourceType === "folder" ? Folder : File;
   return <main className="public-share-shell"><header><Link href="/"><span><Cloud size={20} /></span>栖云</Link><span><ShieldCheck size={15} /> 加密分享</span></header><section className="public-share-card"><div className="share-hero"><span className="share-kind"><KindIcon size={27} /></span><div><small>{data.resourceType === "album" ? "共享相册" : data.resourceType === "folder" ? "共享文件夹" : "共享文件"}</small><h1>{data.name}</h1>{data.description && <p>{data.description}</p>}</div>{data.downloadUrl && <a className="primary-button" href={data.downloadUrl}><Download size={17} /> 下载文件</a>}{data.archiveUrl && <a className="primary-button" href={data.archiveUrl}><Archive size={17} /> 打包下载</a>}</div>{data.items && <div className={data.resourceType === "album" ? "public-photo-grid" : "public-file-list"}>{data.items.map((item, index) => data.resourceType === "album" ? <article key={`${item.name}-${index}`}>{item.previewUrl ? <img src={item.previewUrl} alt={item.remark || item.name} /> : <span><ImageIcon /></span>}<div><strong>{item.remark || item.name}</strong><small>{item.name}</small></div></article> : <div key={`${item.relativePath}-${index}`}><span>{item.kind === "folder" ? <Folder size={18} /> : <File size={18} />}</span><strong>{item.relativePath || item.name}</strong><small>{item.kind === "folder" ? "文件夹" : formatPublicBytes(item.sizeBytes || 0)}</small></div>)}</div>}</section></main>;
 }
