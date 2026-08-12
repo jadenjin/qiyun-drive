@@ -29,38 +29,58 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
+	type photoRecord struct {
+		nodeID, assetID               uuid.UUID
+		name, objectKey, mime, remark string
+		size                          int64
+		takenAt                       *time.Time
+		width, height                 *int
+		camera, smallKey, largeKey    *string
+		createdAt                     time.Time
+	}
+	records := make([]photoRecord, 0)
+	ids := make([]uuid.UUID, 0)
 	for rows.Next() {
-		var nodeID, assetID uuid.UUID
-		var name, objectKey, mime, remark string
-		var size int64
-		var takenAt *time.Time
-		var width, height *int
-		var camera, smallKey, largeKey *string
-		var createdAt time.Time
-		if err := rows.Scan(&nodeID, &name, &assetID, &objectKey, &mime, &size, &takenAt, &width, &height, &camera, &remark, &smallKey, &largeKey, &createdAt); err != nil {
+		var item photoRecord
+		if err := rows.Scan(&item.nodeID, &item.name, &item.assetID, &item.objectKey, &item.mime, &item.size, &item.takenAt, &item.width, &item.height, &item.camera, &item.remark, &item.smallKey, &item.largeKey, &item.createdAt); err != nil {
+			rows.Close()
 			internalError(w, err)
 			return
 		}
-		permission, err := s.nodePermission(r.Context(), a, nodeID)
-		if err != nil || permission < permissionViewer {
+		records = append(records, item)
+		ids = append(ids, item.nodeID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		internalError(w, err)
+		return
+	}
+	rows.Close()
+	permissions, err := s.nodePermissions(r.Context(), a, spaceID, ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(records))
+	for _, item := range records {
+		permission := permissions[item.nodeID]
+		if permission < permissionViewer {
 			continue
 		}
-		thumbKey := objectKey
-		if smallKey != nil && *smallKey != "" {
-			thumbKey = *smallKey
+		thumbKey := item.objectKey
+		if item.smallKey != nil && *item.smallKey != "" {
+			thumbKey = *item.smallKey
 		}
-		previewKey := objectKey
-		if largeKey != nil && *largeKey != "" {
-			previewKey = *largeKey
+		previewKey := item.objectKey
+		if item.largeKey != nil && *item.largeKey != "" {
+			previewKey = *item.largeKey
 		}
 		thumbURL, _ := s.store.PresignGet(r.Context(), thumbKey, "")
 		previewURL, _ := s.store.PresignGet(r.Context(), previewKey, "")
 		items = append(items, map[string]any{
-			"nodeId": nodeID, "assetId": assetID, "name": name, "mimeType": mime, "sizeBytes": size,
-			"takenAt": takenAt, "createdAt": createdAt, "width": width, "height": height, "camera": camera,
-			"remark": remark, "thumbUrl": thumbURL, "previewUrl": previewURL, "permission": permissionName(permission),
+			"nodeId": item.nodeID, "assetId": item.assetID, "name": item.name, "mimeType": item.mime, "sizeBytes": item.size,
+			"takenAt": item.takenAt, "createdAt": item.createdAt, "width": item.width, "height": item.height, "camera": item.camera,
+			"remark": item.remark, "thumbUrl": thumbURL, "previewUrl": previewURL, "permission": permissionName(permission),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
@@ -128,26 +148,47 @@ func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
+	type albumRecord struct {
+		id                uuid.UUID
+		name, description string
+		created           time.Time
+		count             int64
+		coverKey          *string
+	}
+	records := make([]albumRecord, 0)
+	ids := make([]uuid.UUID, 0)
 	for rows.Next() {
-		var id uuid.UUID
-		var name, description string
-		var created time.Time
-		var count int64
-		var coverKey *string
-		if err := rows.Scan(&id, &name, &description, &created, &count, &coverKey); err != nil {
+		var item albumRecord
+		if err := rows.Scan(&item.id, &item.name, &item.description, &item.created, &item.count, &item.coverKey); err != nil {
+			rows.Close()
 			internalError(w, err)
 			return
 		}
-		permission, _ := s.albumPermission(r.Context(), a, id)
-		if permission >= permissionViewer {
-			item := map[string]any{"id": id, "name": name, "description": description, "itemCount": count, "permission": permissionName(permission), "createdAt": created}
-			if coverKey != nil {
-				item["coverUrl"], _ = s.store.PresignGet(r.Context(), *coverKey, "")
-			}
-			items = append(items, item)
+		records = append(records, item)
+		ids = append(ids, item.id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		internalError(w, err)
+		return
+	}
+	rows.Close()
+	permissions, err := s.albumPermissions(r.Context(), a, spaceID, ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		permission := permissions[record.id]
+		if permission < permissionViewer {
+			continue
 		}
+		item := map[string]any{"id": record.id, "name": record.name, "description": record.description, "itemCount": record.count, "permission": permissionName(permission), "createdAt": record.created}
+		if record.coverKey != nil {
+			item["coverUrl"], _ = s.store.PresignGet(r.Context(), *record.coverKey, "")
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

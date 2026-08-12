@@ -115,6 +115,57 @@ func nodePermissionWith(ctx context.Context, db permissionQuerier, a actor, node
 	return base, rows.Err()
 }
 
+// nodePermissions resolves many nodes in one recursive query. Listing a large
+// directory or photo timeline must not issue one permission query per item.
+func (s *Server) nodePermissions(ctx context.Context, a actor, spaceID uuid.UUID, nodeIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+	result := make(map[uuid.UUID]int, len(nodeIDs))
+	if len(nodeIDs) == 0 {
+		return result, nil
+	}
+	base, err := s.spacePermission(ctx, a, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if base == permissionNone || base == permissionManager {
+		for _, id := range nodeIDs {
+			result[id] = base
+		}
+		return result, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		WITH RECURSIVE chain(target_id,id,parent_id,inherit_permissions,depth) AS (
+			SELECT n.id,n.id,n.parent_id,n.inherit_permissions,0
+			FROM nodes n WHERE n.id=ANY($1::uuid[]) AND n.space_id=$2
+			UNION ALL
+			SELECT c.target_id,p.id,p.parent_id,p.inherit_permissions,c.depth+1
+			FROM chain c JOIN nodes p ON p.id=c.parent_id WHERE p.space_id=$2
+		), boundaries AS (
+			SELECT c.target_id,c.depth,
+				CASE acl.permission WHEN 'manager' THEN 3 WHEN 'editor' THEN 2 WHEN 'viewer' THEN 1 ELSE 0 END AS level
+			FROM chain c
+			LEFT JOIN acl_entries acl ON acl.resource_type='node' AND acl.resource_id=c.id AND acl.principal_user_id=$3
+			WHERE acl.permission IS NOT NULL OR NOT c.inherit_permissions
+		), nearest AS (
+			SELECT DISTINCT ON (target_id) target_id,level FROM boundaries ORDER BY target_id,depth
+		), targets AS (
+			SELECT DISTINCT target_id FROM chain WHERE depth=0
+		)
+		SELECT t.target_id,COALESCE(n.level,$4) FROM targets t LEFT JOIN nearest n ON n.target_id=t.target_id`, nodeIDs, spaceID, a.UserID, base)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var level int
+		if err := rows.Scan(&id, &level); err != nil {
+			return nil, err
+		}
+		result[id] = level
+	}
+	return result, rows.Err()
+}
+
 func (s *Server) subtreePermissionAtLeast(ctx context.Context, a actor, nodeID uuid.UUID, required int) (bool, error) {
 	rows, err := s.db.Query(ctx, `
 		WITH RECURSIVE tree AS (
@@ -214,4 +265,41 @@ func albumPermissionWith(ctx context.Context, db permissionQuerier, a actor, alb
 		return permissionNone, nil
 	}
 	return base, nil
+}
+
+func (s *Server) albumPermissions(ctx context.Context, a actor, spaceID uuid.UUID, albumIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+	result := make(map[uuid.UUID]int, len(albumIDs))
+	if len(albumIDs) == 0 {
+		return result, nil
+	}
+	base, err := s.spacePermission(ctx, a, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if base == permissionNone || base == permissionManager {
+		for _, id := range albumIDs {
+			result[id] = base
+		}
+		return result, nil
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT al.id,
+			CASE acl.permission WHEN 'manager' THEN 3 WHEN 'editor' THEN 2 WHEN 'viewer' THEN 1
+			ELSE CASE WHEN al.inherit_permissions THEN $4 ELSE 0 END END
+		FROM albums al
+		LEFT JOIN acl_entries acl ON acl.resource_type='album' AND acl.resource_id=al.id AND acl.principal_user_id=$3
+		WHERE al.id=ANY($1::uuid[]) AND al.space_id=$2`, albumIDs, spaceID, a.UserID, base)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var level int
+		if err := rows.Scan(&id, &level); err != nil {
+			return nil, err
+		}
+		result[id] = level
+	}
+	return result, rows.Err()
 }

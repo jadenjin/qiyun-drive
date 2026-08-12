@@ -196,8 +196,10 @@ export function CloudDrive() {
   const albumUploadTarget = useRef<Album | null>(null);
   const resumeAttempted = useRef(false);
   const uploadControllers = useRef(new Map<string, AbortController>());
+  const refreshController = useRef<AbortController | null>(null);
 
   const selectedSpace = spaces.find((space) => space.id === spaceId) || spaces[0];
+  const activeModal = dialog ? `name:${dialog}` : shareTarget ? "share" : createdShareURL ? "created-share" : createdActionLink ? "created-action" : photoViewer ? "photo" : filePreview ? "file-preview" : albumEditor ? "album-edit" : nodeEditor ? "rename" : moveEditor ? "move" : permissionEditor ? "permission" : accountDialogOpen ? "account" : permissionGuideOpen ? "permission-guide" : quotaEditor ? "quota" : "";
 
   const loadWorkspace = useCallback(async () => {
     const [spaceResponse, shareResponse, me, memberResponse] = await Promise.all([
@@ -243,35 +245,112 @@ export function CloudDrive() {
 
   const refreshView = useCallback(async () => {
     if (status !== "ready" || !spaceId) return;
+    refreshController.current?.abort();
+    const controller = new AbortController();
+    refreshController.current = controller;
+    const request = <T,>(path: string) => api<T>(path, { signal: controller.signal });
     try {
       if (view === "files") {
-        const result = await api<{ items: NodeItem[] }>(`/nodes?spaceId=${spaceId}${currentParent ? `&parentId=${currentParent}` : ""}`);
-        setNodes(result.items);
+        const result = await request<{ items: NodeItem[] }>(`/nodes?spaceId=${spaceId}${currentParent ? `&parentId=${currentParent}` : ""}`);
+        if (!controller.signal.aborted) setNodes(result.items);
       } else if (view === "photos") {
-        const result = await api<{ items: PhotoItem[] }>(`/photos?spaceId=${spaceId}`);
-        setPhotos(result.items);
+        const result = await request<{ items: PhotoItem[] }>(`/photos?spaceId=${spaceId}`);
+        if (!controller.signal.aborted) setPhotos(result.items);
       } else if (view === "albums") {
-        const result = await api<{ items: Album[] }>(`/albums?spaceId=${spaceId}`);
-        setAlbums(result.items);
+        const result = await request<{ items: Album[] }>(`/albums?spaceId=${spaceId}`);
+        if (!controller.signal.aborted) setAlbums(result.items);
       } else if (view === "family") {
-        const memberRequest = api<{ items: Member[] }>("/members");
+        const memberRequest = request<{ items: Member[] }>("/members");
         const canAudit = currentUser?.role === "owner" || currentUser?.role === "admin";
-        const [result, audit] = await Promise.all([memberRequest, canAudit ? api<{ items: AuditItem[] }>("/admin/audit") : Promise.resolve({ items: [] as AuditItem[] })]);
-        setMembers(result.items);
-        setAuditItems(audit.items);
+        const [result, audit] = await Promise.all([memberRequest, canAudit ? request<{ items: AuditItem[] }>("/admin/audit") : Promise.resolve({ items: [] as AuditItem[] })]);
+        if (!controller.signal.aborted) {
+          setMembers(result.items);
+          setAuditItems(audit.items);
+        }
       } else if (view === "shares") {
-        const result = await api<{ items: ShareItem[] }>("/shares");
-        setShares(result.items);
+        const result = await request<{ items: ShareItem[] }>("/shares");
+        if (!controller.signal.aborted) setShares(result.items);
       } else if (view === "trash") {
-        const result = await api<{ items: TrashItem[] }>("/trash");
-        setTrashNodes(result.items);
+        const result = await request<{ items: TrashItem[] }>("/trash");
+        if (!controller.signal.aborted) setTrashNodes(result.items);
       }
     } catch (error) {
-      showToast(error instanceof Error ? error.message : "加载失败");
+      if (!(error instanceof DOMException && error.name === "AbortError")) showToast(error instanceof Error ? error.message : "加载失败");
+    } finally {
+      if (refreshController.current === controller) refreshController.current = null;
     }
   }, [currentParent, currentUser?.role, spaceId, status, view]);
 
   useEffect(() => { refreshView(); }, [refreshView]);
+
+  useEffect(() => () => refreshController.current?.abort(), []);
+
+  useEffect(() => {
+    if (!activeModal) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const dialogs = document.querySelectorAll<HTMLElement>('[aria-modal="true"],.modal-backdrop > .modal');
+    const modal = dialogs.item(dialogs.length - 1);
+    if (!modal) return;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    if (!modal.hasAttribute("aria-label") && !modal.hasAttribute("aria-labelledby")) {
+      const title = modal.querySelector<HTMLElement>("h2");
+      if (title) {
+        title.id ||= "active-modal-title";
+        modal.setAttribute("aria-labelledby", title.id);
+      }
+    }
+    if (!modal.hasAttribute("tabindex")) modal.tabIndex = -1;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusable = () => Array.from(modal.querySelectorAll<HTMLElement>('button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])')).filter((element) => element.getClientRects().length > 0);
+    const focusTimer = window.setTimeout(() => (focusable()[0] || modal).focus(), 0);
+    const close = () => {
+      if (activeModal.startsWith("name:")) setDialog(null);
+      else if (activeModal === "share") setShareTarget(null);
+      else if (activeModal === "created-share") setCreatedShareURL("");
+      else if (activeModal === "created-action") setCreatedActionLink(null);
+      else if (activeModal === "photo") setPhotoViewer(null);
+      else if (activeModal === "file-preview") setFilePreview(null);
+      else if (activeModal === "album-edit") setAlbumEditor(null);
+      else if (activeModal === "rename") setNodeEditor(null);
+      else if (activeModal === "move") setMoveEditor(null);
+      else if (activeModal === "permission") setPermissionEditor(null);
+      else if (activeModal === "account") setAccountDialogOpen(false);
+      else if (activeModal === "permission-guide") setPermissionGuideOpen(false);
+      else if (activeModal === "quota") setQuotaEditor(null);
+    };
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const elements = focusable();
+      if (!elements.length) {
+        event.preventDefault();
+        modal.focus();
+        return;
+      }
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener("keydown", handleKey);
+      document.body.style.overflow = previousOverflow;
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
+  }, [activeModal]);
 
   useEffect(() => {
     const focusSearch = (event: KeyboardEvent) => {
@@ -847,7 +926,7 @@ export function CloudDrive() {
         <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu size={21} /></button><div className="search-box"><Search size={18} /><input ref={searchInput} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索当前页面" aria-label="搜索" /><kbd>Ctrl K</kbd></div><div className="notification-wrap"><button className="icon-button" onClick={() => setNotificationsOpen((value) => !value)} aria-label="通知"><Bell size={19} />{uploads.some((item) => item.state === "failed" || item.state === "uploading") && <span className="notification-dot" />}</button>{notificationsOpen && <div className="notification-menu"><strong>最近上传</strong>{uploads.length ? uploads.slice(0, 5).map((item) => <span key={item.id}><File size={14} /><span>{item.name}<small>{item.state === "ready" ? "上传完成" : item.state === "failed" ? item.error || "上传失败" : item.state === "paused" ? "已暂停" : "上传中"}</small></span></span>) : <p>暂无通知</p>}</div>}</div><button className="avatar-button" onClick={() => { setMenuOpen(true); setAccountOpen(true); }} aria-label="账户菜单">{userInitial}</button></header>
         <div className="content">
           {status === "preview" && <div className="preview-banner"><Sparkles size={16} /><span>当前是界面预览。启动整套服务后，文件与照片会安全存入你的 MinIO。</span><button onClick={() => setStatus("setup")}>体验初始化</button></div>}
-          <div className="page-heading"><div><p>{viewMeta[view].kicker}</p><h1>{viewMeta[view].title}</h1></div><div className="heading-actions">{view === "files" && <><button className="secondary-button" onClick={() => setDialog("folder")}><Plus size={17} /> 新建文件夹</button><button className="secondary-button folder-upload-button" onClick={() => folderInput.current?.click()}><UploadCloud size={17} /> 上传文件夹</button><button className="primary-button" onClick={() => fileInput.current?.click()}><UploadCloud size={18} /> 上传文件</button></>}{view === "albums" && <button className="primary-button" onClick={() => setDialog("album")}><Plus size={18} /> 新建相册</button>}{view === "family" && <button className="primary-button" onClick={() => setDialog("invite")}><UserPlus size={18} /> 邀请成员</button>}</div></div>
+          <div className="page-heading"><div><p>{viewMeta[view].kicker}</p><h1>{viewMeta[view].title}</h1></div><div className="heading-actions">{view === "files" && <><button className="secondary-button" onClick={() => setDialog("folder")} aria-label="新建文件夹"><Plus size={17} /> 新建文件夹</button><button className="secondary-button folder-upload-button" onClick={() => folderInput.current?.click()} aria-label="上传文件夹"><UploadCloud size={17} /> 上传文件夹</button><button className="primary-button" onClick={() => fileInput.current?.click()} aria-label="上传文件"><UploadCloud size={18} /> 上传文件</button></>}{view === "albums" && <button className="primary-button" onClick={() => setDialog("album")}><Plus size={18} /> 新建相册</button>}{view === "family" && <button className="primary-button" onClick={() => setDialog("invite")}><UserPlus size={18} /> 邀请成员</button>}</div></div>
           <input ref={fileInput} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={(node) => { folderInput.current = node; if (node) node.setAttribute("webkitdirectory", ""); }} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={albumInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handleAlbumPhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
@@ -874,7 +953,7 @@ export function CloudDrive() {
       {accountDialogOpen && currentUser && <AccountDialog user={currentUser} sessions={sessions} sessionsLoading={sessionsLoading} onClose={() => setAccountDialogOpen(false)} onProfile={updateProfile} onPassword={changeOwnPassword} onRevokeSession={revokeOwnSession} />}
       {permissionGuideOpen && <PermissionGuideDialog onClose={() => setPermissionGuideOpen(false)} />}
       {quotaEditor && <QuotaDialog space={quotaEditor} onClose={() => setQuotaEditor(null)} onSubmit={(quotaBytes) => updateSpaceQuota(quotaEditor, quotaBytes)} />}
-      {toast && <div className="toast"><ShieldCheck size={18} />{toast}</div>}
+      {toast && <div className="toast" role="status" aria-live="polite"><ShieldCheck size={18} />{toast}</div>}
     </div>
   );
 }
@@ -918,15 +997,15 @@ function PhotoView({ photos, onOpen }: { photos: PhotoItem[]; onOpen: (photo: Ph
     });
     return Array.from(result.entries());
   }, [photos]);
-  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自所有相册与文件目录，按拍摄时间自动整理</small></span><span className="timeline-label"><Clock3 size={17} /> 时间线</span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="在相册中上传照片后，这里会按拍摄日期自动生成时间线" />}</div>;
+  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自所有相册与文件目录，按拍摄时间自动整理</small></span><span className="timeline-label"><Clock3 size={17} /> 时间线</span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="在相册中上传照片后，这里会按拍摄日期自动生成时间线" />}</div>;
 }
 
 function AlbumView({ albums, onOpen, onUpload, onShare }: { albums: Album[]; onOpen: (album: Album) => void; onUpload: (album: Album) => void; onShare: (album: Album) => void }) {
-  return <div className="album-grid">{albums.map((album, index) => <article className="album-card" key={album.id}><button type="button" className={`album-cover cover-${index % 3}`} onClick={() => onOpen(album)} aria-label={`打开相册 ${album.name}`}>{album.coverUrl ? <img src={album.coverUrl} alt="" /> : <><div className="cover-stack one" /><div className="cover-stack two" /><span><ImageIcon size={28} /></span></>}</button><div className="album-copy"><button type="button" className="album-title" onClick={() => onOpen(album)}><h3>{album.name}</h3></button><p>{album.description || "从这里上传照片，它们也会出现在照片时间线中"}</p><div><span>{album.itemCount} 张照片</span><span className="album-actions"><button className="album-upload" onClick={() => onUpload(album)}><UploadCloud size={15} /> 上传照片</button><button onClick={() => onShare(album)} aria-label="分享相册"><Share2 size={17} /></button></span></div></div></article>)}{!albums.length && <EmptyState icon={Images} title="还没有相册" text="新建相册，把同一段故事里的照片放在一起" />}</div>;
+  return <div className="album-grid">{albums.map((album, index) => <article className="album-card" key={album.id}><button type="button" className={`album-cover cover-${index % 3}`} onClick={() => onOpen(album)} aria-label={`打开相册 ${album.name}`}>{album.coverUrl ? <img src={album.coverUrl} alt="" loading="lazy" decoding="async" /> : <><div className="cover-stack one" /><div className="cover-stack two" /><span><ImageIcon size={28} /></span></>}</button><div className="album-copy"><button type="button" className="album-title" onClick={() => onOpen(album)}><h3>{album.name}</h3></button><p>{album.description || "从这里上传照片，它们也会出现在照片时间线中"}</p><div><span>{album.itemCount} 张照片</span><span className="album-actions"><button className="album-upload" onClick={() => onUpload(album)}><UploadCloud size={15} /> 上传照片</button><button onClick={() => onShare(album)} aria-label="分享相册"><Share2 size={17} /></button></span></div></div></article>)}{!albums.length && <EmptyState icon={Images} title="还没有相册" text="新建相册，把同一段故事里的照片放在一起" />}</div>;
 }
 
 function AlbumDetail({ album, photos, onBack, onUpload, onOpen, onEdit, onPermissions, onShare, onDelete }: { album: Album; photos: PhotoItem[]; onBack: () => void; onUpload: (album: Album) => void; onOpen: (photo: PhotoItem) => void; onEdit: (album: Album) => void; onPermissions?: (album: Album) => void; onShare: (album: Album) => void; onDelete: (album: Album) => void }) {
-  return <section className="album-detail"><header className="album-detail-head"><button className="back-button" onClick={onBack}><ArrowLeft size={17} /> 返回相册</button><div><small>相册 · {photos.length} 张</small><h2>{album.name}</h2><p>{album.description || "还没有相册描述"}</p></div><span className="album-detail-actions"><button onClick={() => onEdit(album)}><Edit3 size={16} /> 编辑</button>{onPermissions && <button onClick={() => onPermissions(album)}><ShieldCheck size={16} /> 权限</button>}<button onClick={() => onShare(album)}><Share2 size={16} /> 分享</button><button className="primary-button" onClick={() => onUpload(album)}><UploadCloud size={17} /> 上传照片</button><button className="danger-icon" onClick={() => onDelete(album)} aria-label="删除相册"><Trash2 size={17} /></button></span></header>{photos.length ? <div className="album-photo-grid">{photos.map((photo) => <button type="button" key={photo.nodeId} onClick={() => onOpen(photo)}><img src={photo.thumbUrl || photo.previewUrl} alt={photo.remark || photo.name} /><span><strong>{photo.remark || photo.name}</strong><small>{relativeDate(photo.takenAt || photo.createdAt)}</small></span></button>)}</div> : <EmptyState icon={ImageIcon} title="相册还是空的" text="点击“上传照片”，照片会加入相册并同步到时间线" />}</section>;
+  return <section className="album-detail"><header className="album-detail-head"><button className="back-button" onClick={onBack}><ArrowLeft size={17} /> 返回相册</button><div><small>相册 · {photos.length} 张</small><h2>{album.name}</h2><p>{album.description || "还没有相册描述"}</p></div><span className="album-detail-actions"><button onClick={() => onEdit(album)}><Edit3 size={16} /> 编辑</button>{onPermissions && <button onClick={() => onPermissions(album)}><ShieldCheck size={16} /> 权限</button>}<button onClick={() => onShare(album)}><Share2 size={16} /> 分享</button><button className="primary-button" onClick={() => onUpload(album)}><UploadCloud size={17} /> 上传照片</button><button className="danger-icon" onClick={() => onDelete(album)} aria-label="删除相册"><Trash2 size={17} /></button></span></header>{photos.length ? <div className="album-photo-grid">{photos.map((photo) => <button type="button" key={photo.nodeId} onClick={() => onOpen(photo)}><img src={photo.thumbUrl || photo.previewUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /><span><strong>{photo.remark || photo.name}</strong><small>{relativeDate(photo.takenAt || photo.createdAt)}</small></span></button>)}</div> : <EmptyState icon={ImageIcon} title="相册还是空的" text="点击“上传照片”，照片会加入相册并同步到时间线" />}</section>;
 }
 
 function ShareView({ shares: actualShares, onRevoke }: { shares?: ShareItem[]; onRevoke: (id: string) => void }) {

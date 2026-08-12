@@ -272,3 +272,24 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(48, 130, 99,
 @media (max-width: 760px) { .file-preview { grid-template-rows: 58px minmax(0,1fr); }.file-preview > header { padding: 0 11px; }.file-preview > header small { display: none; }.file-preview > header strong { max-width: 42vw; }.file-preview > header button { min-height: 32px; padding: 0 8px; }.file-preview-stage { padding: 8px; }.sort-picker > span { display: none; } }
 @media (max-width: 780px) { .heading-actions .secondary-button:first-child { display: inline-flex; }.heading-actions .folder-upload-button { display: none; }.file-row { grid-template-columns: minmax(0,1fr) minmax(120px,auto); }.row-actions { max-width: 220px; flex-wrap: wrap; overflow: visible; justify-content: flex-end; }.tile-actions { flex-wrap: wrap; }.selection-toolbar { flex-wrap: wrap; }.selection-toolbar strong { width: 100%; }.permission-members > label { grid-template-columns: 34px 1fr; }.permission-members select { grid-column: 1 / -1; }.member-role-select { max-width: 94px; }.share-tabs { padding-inline: 12px; } }
 @media (prefers-reduced-motion: reduce) { *,*::before,*::after { scroll-behavior: auto!important; transition: none!important; animation: none!important; } }
+
+/* Large timelines stay cheap until their date group approaches the viewport. */
+.photo-group { content-visibility: auto; contain-intrinsic-size: 520px; }
+
+@media (max-width: 780px) {
+  .heading-actions { max-width: 220px; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+  .heading-actions .secondary-button,
+  .heading-actions .folder-upload-button { display: inline-flex; }
+  .row-actions button,
+  .icon-plain,
+  .album-detail-actions > button { min-width: 40px; min-height: 40px; }
+  .modal-backdrop { padding: 10px; }
+  .modal { max-height: calc(100dvh - 20px); overflow-y: auto; }
+  .toast { max-width: calc(100vw - 28px); white-space: normal; text-align: center; }
+}
+
+@media (max-width: 430px) {
+  .heading-actions { max-width: 140px; }
+  .heading-actions > button { width: 40px; padding: 0; overflow: hidden; font-size: 0; }
+  .heading-actions > button svg { flex: 0 0 auto; }
+}

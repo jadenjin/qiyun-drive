@@ -51,7 +51,7 @@ test("drive UI uses real trash/share data and exposes folder and album uploads",
     readFile(new URL("app/cloud-drive.tsx", root), "utf8"),
     readFile(new URL("app/upload-client.ts", root), "utf8"),
   ]);
-  assert.match(drive, /api<\{ items: TrashItem\[\] \}>\("\/trash"\)/);
+  assert.match(drive, /request<\{ items: TrashItem\[\] \}>\("\/trash"\)/);
   assert.match(drive, /activeShareCount > 0/);
   assert.doesNotMatch(drive, /className="nav-count">3</);
   assert.match(drive, /上传文件夹/);
@@ -64,13 +64,17 @@ test("drive UI uses real trash/share data and exposes folder and album uploads",
 });
 
 test("drive UI exposes complete album, file-management, permission, and account flows", async () => {
-  const [drive, routes, nodes, acl, auth, worker] = await Promise.all([
+  const [drive, routes, nodes, acl, auth, worker, permissions, photos, publicFlows, styles] = await Promise.all([
     readFile(new URL("app/cloud-drive.tsx", root), "utf8"),
     readFile(new URL("backend/internal/httpapi/server.go", root), "utf8"),
     readFile(new URL("backend/internal/httpapi/nodes.go", root), "utf8"),
     readFile(new URL("backend/internal/httpapi/acl.go", root), "utf8"),
     readFile(new URL("backend/internal/httpapi/auth_handlers.go", root), "utf8"),
     readFile(new URL("backend/cmd/worker/main.go", root), "utf8"),
+    readFile(new URL("backend/internal/httpapi/permissions.go", root), "utf8"),
+    readFile(new URL("backend/internal/httpapi/photos.go", root), "utf8"),
+    readFile(new URL("app/token-flows.tsx", root), "utf8"),
+    readFile(new URL("app/globals.css", root), "utf8"),
   ]);
   assert.match(drive, /function AlbumDetail/);
   assert.match(drive, /function PhotoViewer/);
@@ -85,6 +89,9 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(drive, /登录设备/);
   assert.match(drive, /访问密码至少需要 4 个字符/);
   assert.match(drive, /creatorName/);
+  assert.match(drive, /refreshController\.current\?\.abort\(\)/);
+  assert.match(drive, /role="status" aria-live="polite"/);
+  assert.match(drive, /loading="lazy" decoding="async"/);
   assert.match(drive, /文件排序方式/);
   assert.match(drive, /api<\{ items: Member\[\] \}>\("\/members"\)/);
   assert.match(drive, /最近活动/);
@@ -102,6 +109,13 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(auth, /func \(s \*Server\) listSessions/);
   assert.match(auth, /func \(s \*Server\) revokeSession/);
   assert.match(routes, /func \(s \*Server\) actorForUser/);
+  assert.match(permissions, /func \(s \*Server\) nodePermissions/);
+  assert.match(permissions, /func \(s \*Server\) albumPermissions/);
+  assert.match(nodes, /s\.nodePermissions\(r\.Context\(\), a, spaceID, ids\)/);
+  assert.match(photos, /s\.albumPermissions\(r\.Context\(\), a, spaceID, ids\)/);
+  assert.match(publicFlows, /loading="lazy" decoding="async"/);
+  assert.match(styles, /\.heading-actions \.folder-upload-button \{ display: inline-flex; \}/);
+  assert.match(styles, /\.modal \{ max-height: calc\(100dvh - 20px\); overflow-y: auto; \}/);
   assert.match(worker, /DELETE FROM invitations WHERE \(accepted_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
   assert.match(worker, /DELETE FROM password_resets WHERE \(used_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
   const deleteNode = worker.indexOf("DELETE FROM nodes WHERE id=$1");

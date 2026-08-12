@@ -39,10 +39,22 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Run("query indexes are applied", func(t *testing.T) {
+		var applied bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='002_query_indexes.sql')`).Scan(&applied); err != nil || !applied {
+			t.Fatalf("query index migration not applied: applied=%v err=%v", applied, err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('sessions_user_expiry_idx','nodes_space_updated_idx','upload_sessions_cleanup_idx','albums_space_updated_idx','public_shares_creator_created_idx','audit_events_household_created_idx')`).Scan(&count); err != nil || count != 6 {
+			t.Fatalf("expected six critical query indexes, got %d: %v", count, err)
+		}
+	})
 
 	memberID, adminID := uuid.New(), uuid.New()
 	personalSpaceID := uuid.New()
 	parentID, childID, shareFolderID, privateFolderID, albumID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	accessiblePhotoID, restrictedPhotoID := uuid.New(), uuid.New()
+	accessibleAssetID, restrictedAssetID := uuid.New(), uuid.New()
 	invitationID := uuid.New()
 	createdAuditResources := make([]uuid.UUID, 0, 8)
 	createdSessionIDs := make([]uuid.UUID, 0, 5)
@@ -55,7 +67,8 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 			_, _ = pool.Exec(ctx, `DELETE FROM public_shares WHERE id=$1`, id)
 		}
 		_, _ = pool.Exec(ctx, `DELETE FROM invitations WHERE id=$1`, invitationID)
-		_, _ = pool.Exec(ctx, `DELETE FROM nodes WHERE id IN ($1,$2)`, parentID, shareFolderID)
+		_, _ = pool.Exec(ctx, `DELETE FROM nodes WHERE id IN ($1,$2,$3)`, parentID, shareFolderID, accessiblePhotoID)
+		_, _ = pool.Exec(ctx, `DELETE FROM assets WHERE id IN ($1,$2)`, accessibleAssetID, restrictedAssetID)
 		_, _ = pool.Exec(ctx, `DELETE FROM albums WHERE id=$1`, albumID)
 		for _, id := range createdSessionIDs {
 			_, _ = pool.Exec(ctx, `DELETE FROM sessions WHERE id=$1`, id)
@@ -94,6 +107,24 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		($5,$2,NULL,'folder','stage4-family-share',false,$3),
 		($6,$7,NULL,'folder','stage4-private-share',true,$3)`, parentID, familySpaceID, memberID, childID, shareFolderID, privateFolderID, personalSpaceID); err != nil {
 		t.Fatalf("seed folders: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO assets(id,space_id,object_key,size_bytes,mime_type,status,created_by) VALUES
+		($1,$2,$3,16,'image/png','ready',$4),($5,$2,$6,16,'image/png','ready',$4)`,
+		accessibleAssetID, familySpaceID, "stage5/"+accessibleAssetID.String()+".png", memberID,
+		restrictedAssetID, "stage5/"+restrictedAssetID.String()+".png"); err != nil {
+		t.Fatalf("seed photo assets: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,inherit_permissions,created_by) VALUES
+		($1,$2,NULL,$3,'file','stage5-visible.png',true,$4),
+		($5,$2,$6,$7,'file','stage5-restricted.png',true,$4)`,
+		accessiblePhotoID, familySpaceID, accessibleAssetID, memberID,
+		restrictedPhotoID, childID, restrictedAssetID); err != nil {
+		t.Fatalf("seed photo nodes: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO photo_details(asset_id,remark) VALUES($1,''),($2,'')`, accessibleAssetID, restrictedAssetID); err != nil {
+		t.Fatalf("seed photo details: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO albums(id,space_id,name,description,inherit_permissions,created_by) VALUES($1,$2,'stage4-revoked-album','',false,$3)`, albumID, familySpaceID, memberID); err != nil {
 		t.Fatalf("seed album: %v", err)
@@ -159,6 +190,42 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 			"token": plain, "username": "stage4-member-" + suffix, "displayName": "重复用户名", "password": "AnotherStrong123!",
 		})
 		requireLiveStatus(t, status, http.StatusConflict, body)
+	})
+
+	t.Run("batch listings preserve permission boundaries", func(t *testing.T) {
+		status, body := liveJSON(t, http.MethodGet, baseURL+"/nodes?spaceId="+familySpaceID.String()+"&parentId="+parentID.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		var nodes struct {
+			Items []struct {
+				ID uuid.UUID `json:"id"`
+			} `json:"items"`
+		}
+		if err := json.Unmarshal(body, &nodes); err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range nodes.Items {
+			if item.ID == childID {
+				t.Fatalf("restricted child leaked through batch node listing: %s", body)
+			}
+		}
+
+		status, body = liveJSON(t, http.MethodGet, baseURL+"/folders/tree?spaceId="+familySpaceID.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		if bytes.Contains(body, []byte(childID.String())) {
+			t.Fatalf("restricted child leaked through batch folder tree: %s", body)
+		}
+
+		status, body = liveJSON(t, http.MethodGet, baseURL+"/albums?spaceId="+familySpaceID.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		if bytes.Contains(body, []byte(albumID.String())) {
+			t.Fatalf("restricted album leaked through batch album listing: %s", body)
+		}
+
+		status, body = liveJSON(t, http.MethodGet, baseURL+"/photos?spaceId="+familySpaceID.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		if !bytes.Contains(body, []byte(accessiblePhotoID.String())) || bytes.Contains(body, []byte(restrictedPhotoID.String())) {
+			t.Fatalf("batch photo listing returned wrong permissions: %s", body)
+		}
 	})
 
 	t.Run("restricted descendants block recursive deletion", func(t *testing.T) {

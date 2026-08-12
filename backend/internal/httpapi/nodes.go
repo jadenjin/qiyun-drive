@@ -104,19 +104,34 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
+	records := make([]nodeRecord, 0)
+	ids := make([]uuid.UUID, 0)
 	for rows.Next() {
 		var n nodeRecord
 		if err := rows.Scan(&n.ID, &n.SpaceID, &n.ParentID, &n.AssetID, &n.Kind, &n.Name, &n.Size, &n.Mime, &n.Status, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			rows.Close()
 			internalError(w, err)
 			return
 		}
-		level, err := s.nodePermission(r.Context(), a, n.ID)
-		if err != nil || level == permissionNone {
-			continue
+		records = append(records, n)
+		ids = append(ids, n.ID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		internalError(w, err)
+		return
+	}
+	rows.Close()
+	permissions, err := s.nodePermissions(r.Context(), a, spaceID, ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(records))
+	for _, n := range records {
+		if level := permissions[n.ID]; level != permissionNone {
+			items = append(items, nodeJSON(n, level))
 		}
-		items = append(items, nodeJSON(n, level))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -138,22 +153,41 @@ func (s *Server) listFolderTree(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
+	type folderRecord struct {
+		id        uuid.UUID
+		parentID  *uuid.UUID
+		name      string
+		updatedAt time.Time
+	}
+	records := make([]folderRecord, 0)
+	ids := make([]uuid.UUID, 0)
 	for rows.Next() {
-		var id uuid.UUID
-		var parentID *uuid.UUID
-		var name string
-		var updatedAt time.Time
-		if err := rows.Scan(&id, &parentID, &name, &updatedAt); err != nil {
+		var item folderRecord
+		if err := rows.Scan(&item.id, &item.parentID, &item.name, &item.updatedAt); err != nil {
+			rows.Close()
 			internalError(w, err)
 			return
 		}
-		permission, err := s.nodePermission(r.Context(), a, id)
-		if err != nil || permission < permissionEditor {
-			continue
+		records = append(records, item)
+		ids = append(ids, item.id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		internalError(w, err)
+		return
+	}
+	rows.Close()
+	permissions, err := s.nodePermissions(r.Context(), a, spaceID, ids)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	items := make([]map[string]any, 0, len(records))
+	for _, item := range records {
+		permission := permissions[item.id]
+		if permission >= permissionEditor {
+			items = append(items, map[string]any{"id": item.id, "parentId": item.parentID, "name": item.name, "permission": permissionName(permission), "updatedAt": item.updatedAt})
 		}
-		items = append(items, map[string]any{"id": id, "parentId": parentID, "name": name, "permission": permissionName(permission), "updatedAt": updatedAt})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
