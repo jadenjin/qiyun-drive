@@ -27,3 +27,18 @@ func TestTokenHashIsStableAndDoesNotExposeToken(t *testing.T) {
 		t.Fatal("stored hash must not equal the plain token")
 	}
 }
+
+func TestValidTokenRequiresExactURLSafeEntropy(t *testing.T) {
+	plain, _, err := NewToken(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ValidToken(plain, 32) {
+		t.Fatal("newly generated token should validate")
+	}
+	for _, invalid := range []string{"", plain + "x", plain[:len(plain)-1], "not+a/url_safe/token"} {
+		if ValidToken(invalid, 32) {
+			t.Fatalf("invalid token accepted: %q", invalid)
+		}
+	}
+}

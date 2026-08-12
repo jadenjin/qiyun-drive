@@ -36,7 +36,7 @@ func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	input.Username = normalizeUsername(input.Username)
 	input.HouseholdName = strings.TrimSpace(input.HouseholdName)
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
-	if input.HouseholdName == "" || len([]rune(input.HouseholdName)) > 100 || input.Username == "" || len([]rune(input.Username)) > 64 || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 || len(input.Timezone) > 100 {
+	if input.HouseholdName == "" || len([]rune(input.HouseholdName)) > 100 || !validUsername(input.Username) || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 || len(input.Timezone) > 100 {
 		writeError(w, http.StatusBadRequest, "invalid_input", "家庭名称、用户名和显示名称不能为空")
 		return
 	}
@@ -205,6 +205,9 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	if _, err = tx.Exec(r.Context(), `UPDATE users SET password_hash=$1 WHERE id=$2`, newHash, a.UserID); err == nil {
 		_, err = tx.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2`, a.UserID, panAuth.TokenHash(cookie.Value))
 	}
+	if err == nil {
+		_, err = tx.Exec(r.Context(), `UPDATE password_resets SET used_at=now() WHERE user_id=$1 AND used_at IS NULL`, a.UserID)
+	}
 	if err != nil {
 		internalError(w, err)
 		return
@@ -231,6 +234,10 @@ func (s *Server) createInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.Role != "admin" {
 		input.Role = "member"
+	}
+	if !canInviteRole(a.Role, input.Role) {
+		writeError(w, http.StatusForbidden, "forbidden", "只有家庭所有者可以邀请管理员")
+		return
 	}
 	plain, hash, err := panAuth.NewToken(32)
 	if err != nil {
@@ -259,7 +266,7 @@ func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 	input.Username = normalizeUsername(input.Username)
 	input.DisplayName = strings.TrimSpace(input.DisplayName)
-	if len(input.Token) > 256 || input.Username == "" || len([]rune(input.Username)) > 64 || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 {
+	if !panAuth.ValidToken(input.Token, 32) || !validUsername(input.Username) || input.DisplayName == "" || len([]rune(input.DisplayName)) > 100 {
 		writeError(w, http.StatusBadRequest, "invalid_input", "用户名和显示名称不能为空")
 		return
 	}
@@ -300,7 +307,11 @@ func (s *Server) acceptInvitation(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `UPDATE invitations SET accepted_at=now() WHERE id=$1`, invitationID)
 	}
 	if err != nil {
-		internalError(w, err)
+		if isUniqueViolation(err, "users_username_lower_idx") {
+			writeError(w, http.StatusConflict, "username_taken", "此用户名已被使用")
+		} else {
+			internalError(w, err)
+		}
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
@@ -386,8 +397,8 @@ func (s *Server) createPasswordReset(w http.ResponseWriter, r *http.Request) {
 		dbNotFound(w, err)
 		return
 	}
-	if targetRole == "owner" && a.Role != "owner" {
-		writeError(w, http.StatusForbidden, "forbidden", "不能重置所有者密码")
+	if !canResetMemberRole(a.Role, targetRole) {
+		writeError(w, http.StatusForbidden, "forbidden", "只有家庭所有者可以重置所有者或管理员密码")
 		return
 	}
 	plain, hash, err := panAuth.NewToken(32)
@@ -396,11 +407,24 @@ func (s *Server) createPasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expires := time.Now().Add(time.Hour)
-	_, err = s.db.Exec(r.Context(), `INSERT INTO password_resets(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, uuid.New(), target, hash, expires)
+	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		internalError(w, err)
 		return
 	}
+	defer tx.Rollback(r.Context())
+	if _, err = tx.Exec(r.Context(), `UPDATE password_resets SET used_at=now() WHERE user_id=$1 AND used_at IS NULL`, target); err == nil {
+		_, err = tx.Exec(r.Context(), `INSERT INTO password_resets(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, uuid.New(), target, hash, expires)
+	}
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		internalError(w, err)
+		return
+	}
+	s.audit(r.Context(), a, "member.password_reset_create", "user", &target, nil)
 	writeJSON(w, http.StatusCreated, map[string]any{"url": s.cfg.PublicBaseURL + "/reset-password/" + plain, "expiresAt": expires})
 }
 
@@ -409,7 +433,7 @@ func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if len(input.Token) > 256 {
+	if !panAuth.ValidToken(input.Token, 32) {
 		writeError(w, http.StatusGone, "invalid_reset", "重置链接无效或已过期")
 		return
 	}
@@ -434,7 +458,7 @@ func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := tx.Exec(r.Context(), `UPDATE users SET password_hash=$1 WHERE id=$2`, hash, userID); err == nil {
-		_, err = tx.Exec(r.Context(), `UPDATE password_resets SET used_at=now() WHERE id=$1`, resetID)
+		_, err = tx.Exec(r.Context(), `UPDATE password_resets SET used_at=now() WHERE user_id=$1 AND used_at IS NULL`, userID)
 	}
 	if err == nil {
 		_, err = tx.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1`, userID)
@@ -448,4 +472,64 @@ func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
+	a := actorFrom(r)
+	cookie, err := r.Cookie("pan_session")
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized", "登录已失效")
+		return
+	}
+	currentHash := panAuth.TokenHash(cookie.Value)
+	rows, err := s.db.Query(r.Context(), `SELECT id,token_hash,created_at,last_seen_at,expires_at FROM sessions WHERE user_id=$1 AND expires_at>now() ORDER BY last_seen_at DESC`, a.UserID)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		var hash string
+		var createdAt, lastSeenAt, expiresAt time.Time
+		if err := rows.Scan(&id, &hash, &createdAt, &lastSeenAt, &expiresAt); err != nil {
+			internalError(w, err)
+			return
+		}
+		items = append(items, map[string]any{"id": id, "current": hash == currentHash, "createdAt": createdAt, "lastSeenAt": lastSeenAt, "expiresAt": expiresAt})
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
+	a := actorFrom(r)
+	id, ok := parseUUIDParam(w, r, "id")
+	if !ok {
+		return
+	}
+	var revokedHash string
+	if err := s.db.QueryRow(r.Context(), `DELETE FROM sessions WHERE id=$1 AND user_id=$2 RETURNING token_hash`, id, a.UserID).Scan(&revokedHash); err != nil {
+		if !dbNotFound(w, err) {
+			internalError(w, err)
+		}
+		return
+	}
+	if cookie, err := r.Cookie("pan_session"); err == nil && panAuth.TokenHash(cookie.Value) == revokedHash {
+		clearCookie(w, s.cfg.CookieSecure)
+	}
+	s.audit(r.Context(), a, "account.session_revoke", "session", &id, nil)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func canInviteRole(actorRole, invitedRole string) bool {
+	return actorRole == "owner" || (actorRole == "admin" && invitedRole == "member")
+}
+
+func canResetMemberRole(actorRole, targetRole string) bool {
+	return actorRole == "owner" || (actorRole == "admin" && targetRole == "member")
 }

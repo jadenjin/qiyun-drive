@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"pan/backend/internal/config"
@@ -68,7 +70,7 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 		r.Get("/bootstrap", s.bootstrapStatus)
 		r.Post("/bootstrap", s.bootstrap)
 		r.With(s.limitSensitive).Post("/auth/login", s.login)
-		r.Post("/invitations/accept", s.acceptInvitation)
+		r.With(s.limitSensitive).Post("/invitations/accept", s.acceptInvitation)
 		r.With(s.limitSensitive).Post("/password-resets/complete", s.completePasswordReset)
 		r.With(s.limitSensitive).Post("/public/shares/{token}/unlock", s.unlockShare)
 		r.Get("/public/shares/{token}", s.publicShare)
@@ -78,6 +80,8 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 			r.Get("/me", s.me)
 			r.Patch("/me", s.updateMe)
 			r.Post("/me/password", s.changePassword)
+			r.Get("/me/sessions", s.listSessions)
+			r.Delete("/me/sessions/{id}", s.revokeSession)
 			r.Post("/auth/logout", s.logout)
 			r.Get("/spaces", s.listSpaces)
 			r.Get("/nodes", s.listNodes)
@@ -344,6 +348,15 @@ func actorFrom(r *http.Request) actor {
 	return r.Context().Value(actorKey).(actor)
 }
 
+func (s *Server) actorForUser(ctx context.Context, userID uuid.UUID) (actor, error) {
+	var a actor
+	err := s.db.QueryRow(ctx, `
+		SELECT u.id,hm.household_id,u.username,u.display_name,hm.role
+		FROM users u JOIN household_members hm ON hm.user_id=u.id
+		WHERE u.id=$1 AND NOT u.disabled`, userID).Scan(&a.UserID, &a.HouseholdID, &a.Username, &a.DisplayName, &a.Role)
+	return a, err
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	decoder.DisallowUnknownFields()
@@ -395,6 +408,11 @@ func dbNotFound(w http.ResponseWriter, err error) bool {
 	return false
 }
 
+func isUniqueViolation(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && (constraint == "" || pgErr.ConstraintName == constraint)
+}
+
 func internalError(w http.ResponseWriter, err error) {
 	slog.Error("request failed", "error", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "操作失败，请稍后重试")
@@ -407,6 +425,10 @@ func (s *Server) audit(ctx context.Context, a actor, action, resourceType string
 }
 
 func normalizeUsername(value string) string { return strings.ToLower(strings.TrimSpace(value)) }
+
+var usernamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{2,63}$`)
+
+func validUsername(value string) bool { return usernamePattern.MatchString(value) }
 
 func validatePassword(value string) error {
 	length := len([]rune(value))

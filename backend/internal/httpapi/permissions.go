@@ -115,6 +115,78 @@ func nodePermissionWith(ctx context.Context, db permissionQuerier, a actor, node
 	return base, rows.Err()
 }
 
+func (s *Server) subtreePermissionAtLeast(ctx context.Context, a actor, nodeID uuid.UUID, required int) (bool, error) {
+	rows, err := s.db.Query(ctx, `
+		WITH RECURSIVE tree AS (
+		  SELECT id FROM nodes WHERE id=$1
+		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id
+		)
+		SELECT id FROM tree`, nodeID)
+	if err != nil {
+		return false, err
+	}
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		level, err := s.nodePermission(ctx, a, id)
+		if err != nil {
+			return false, err
+		}
+		if level < required {
+			return false, nil
+		}
+	}
+	return len(ids) > 0, nil
+}
+
+func (s *Server) activeSubtreePermissionAtLeast(ctx context.Context, a actor, nodeID uuid.UUID, required int) (bool, error) {
+	rows, err := s.db.Query(ctx, `
+		WITH RECURSIVE tree AS (
+		  SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NULL
+		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NULL
+		)
+		SELECT id FROM tree`, nodeID)
+	if err != nil {
+		return false, err
+	}
+	ids := make([]uuid.UUID, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return false, err
+	}
+	for _, id := range ids {
+		level, err := s.nodePermission(ctx, a, id)
+		if err != nil {
+			return false, err
+		}
+		if level < required {
+			return false, nil
+		}
+	}
+	return len(ids) > 0, nil
+}
+
 func (s *Server) albumPermission(ctx context.Context, a actor, albumID uuid.UUID) (int, error) {
 	return albumPermissionWith(ctx, s.db, a, albumID)
 }

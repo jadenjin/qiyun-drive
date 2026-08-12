@@ -64,3 +64,8 @@ func TokenHash(token string) string {
 	digest := sha256.Sum256([]byte(token))
 	return base64.RawURLEncoding.EncodeToString(digest[:])
 }
+
+func ValidToken(token string, expectedBytes int) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(token)
+	return err == nil && len(decoded) == expectedBytes
+}

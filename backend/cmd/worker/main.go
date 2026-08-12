@@ -304,6 +304,8 @@ func (w *worker) runMaintenance(ctx context.Context) {
 	w.enqueueExpiredUploadCleanup(ctx)
 	_, _ = w.db.Exec(ctx, `DELETE FROM sessions WHERE expires_at<now()`)
 	_, _ = w.db.Exec(ctx, `DELETE FROM share_access_tokens WHERE expires_at<now()`)
+	_, _ = w.db.Exec(ctx, `DELETE FROM invitations WHERE (accepted_at IS NOT NULL OR expires_at<now()) AND created_at<now()-interval '30 days'`)
+	_, _ = w.db.Exec(ctx, `DELETE FROM password_resets WHERE (used_at IS NOT NULL OR expires_at<now()) AND created_at<now()-interval '30 days'`)
 	_, _ = w.db.Exec(ctx, `
 		INSERT INTO jobs(id,kind,payload)
 		SELECT gen_random_uuid(),'purge_node',jsonb_build_object('nodeId',n.id::text)

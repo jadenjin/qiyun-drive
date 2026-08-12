@@ -167,6 +167,11 @@ func (s *Server) createAlbum(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_name", "相册名称不合法")
 		return
 	}
+	input.Description = strings.TrimSpace(input.Description)
+	if len([]rune(input.Description)) > 2000 {
+		writeError(w, http.StatusBadRequest, "description_too_long", "相册描述最多 2000 个字符")
+		return
+	}
 	level, err := s.spacePermission(r.Context(), a, input.SpaceID)
 	if err != nil || level < permissionEditor {
 		writeError(w, http.StatusNotFound, "not_found", "空间不存在")
@@ -242,7 +247,7 @@ func (s *Server) deleteAlbum(w http.ResponseWriter, r *http.Request) {
 		dbNotFound(w, err)
 		return
 	}
-	if level < permissionManager && creator != a.UserID {
+	if level < permissionEditor || (level < permissionManager && creator != a.UserID) {
 		writeError(w, http.StatusNotFound, "not_found", "相册不存在")
 		return
 	}

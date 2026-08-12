@@ -26,8 +26,9 @@ func (s *Server) createShare(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if len([]rune(input.Password)) > 128 {
-		writeError(w, http.StatusBadRequest, "invalid_password", "分享密码不能超过 128 个字符")
+	passwordLength := len([]rune(strings.TrimSpace(input.Password)))
+	if passwordLength > 128 || (passwordLength > 0 && passwordLength < 4) {
+		writeError(w, http.StatusBadRequest, "invalid_password", "分享密码留空或使用 4 至 128 个字符")
 		return
 	}
 	dbResourceType := input.ResourceType
@@ -48,6 +49,17 @@ func (s *Server) createShare(w http.ResponseWriter, r *http.Request) {
 	if err != nil || level < permissionManager || (dbResourceType != "file" && dbResourceType != "folder" && dbResourceType != "album") {
 		writeError(w, http.StatusNotFound, "not_found", "分享资源不存在")
 		return
+	}
+	if dbResourceType == "folder" {
+		allowed, permissionErr := s.activeSubtreePermissionAtLeast(r.Context(), a, input.ResourceID, permissionViewer)
+		if permissionErr != nil {
+			internalError(w, permissionErr)
+			return
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "subtree_forbidden", "目录中包含你无权分享的内容")
+			return
+		}
 	}
 	if input.ExpiresAt != nil && input.ExpiresAt.Before(time.Now()) {
 		writeError(w, http.StatusBadRequest, "invalid_expiry", "有效期必须晚于当前时间")
@@ -83,11 +95,19 @@ func (s *Server) createShare(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listShares(w http.ResponseWriter, r *http.Request) {
 	a := actorFrom(r)
+	canAdministerFamilyShares := a.Role == "owner" || a.Role == "admin"
 	rows, err := s.db.Query(r.Context(), `
 		SELECT s.id,s.resource_type,s.resource_id,
 		       COALESCE((SELECT n.name FROM nodes n WHERE n.id=s.resource_id),(SELECT a.name FROM albums a WHERE a.id=s.resource_id),'已删除内容'),
-		       s.password_hash IS NOT NULL,s.allow_download,s.expires_at,s.revoked_at,s.created_at
-		FROM public_shares s WHERE s.created_by=$1 ORDER BY s.created_at DESC`, a.UserID)
+		       s.password_hash IS NOT NULL,s.allow_download,s.expires_at,s.revoked_at,s.created_at,
+		       u.display_name,s.created_by=$1
+		FROM public_shares s
+		JOIN users u ON u.id=s.created_by
+		WHERE s.created_by=$1 OR ($2 AND (
+			EXISTS (SELECT 1 FROM nodes n JOIN spaces sp ON sp.id=n.space_id WHERE s.resource_type IN ('file','folder') AND n.id=s.resource_id AND sp.kind='family' AND sp.household_id=$3)
+			OR EXISTS (SELECT 1 FROM albums al JOIN spaces sp ON sp.id=al.space_id WHERE s.resource_type='album' AND al.id=s.resource_id AND sp.kind='family' AND sp.household_id=$3)
+		))
+		ORDER BY s.created_at DESC`, a.UserID, canAdministerFamilyShares, a.HouseholdID)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -96,15 +116,19 @@ func (s *Server) listShares(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0)
 	for rows.Next() {
 		var id, resourceID uuid.UUID
-		var resourceType, resourceName string
-		var hasPassword, allowDownload bool
+		var resourceType, resourceName, creatorName string
+		var hasPassword, allowDownload, own bool
 		var expiresAt, revokedAt *time.Time
 		var createdAt time.Time
-		if err := rows.Scan(&id, &resourceType, &resourceID, &resourceName, &hasPassword, &allowDownload, &expiresAt, &revokedAt, &createdAt); err != nil {
+		if err := rows.Scan(&id, &resourceType, &resourceID, &resourceName, &hasPassword, &allowDownload, &expiresAt, &revokedAt, &createdAt, &creatorName, &own); err != nil {
 			internalError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "resourceType": resourceType, "resourceId": resourceID, "resourceName": resourceName, "hasPassword": hasPassword, "allowDownload": allowDownload, "expiresAt": expiresAt, "revokedAt": revokedAt, "createdAt": createdAt})
+		items = append(items, map[string]any{"id": id, "resourceType": resourceType, "resourceId": resourceID, "resourceName": resourceName, "hasPassword": hasPassword, "allowDownload": allowDownload, "expiresAt": expiresAt, "revokedAt": revokedAt, "createdAt": createdAt, "creatorName": creatorName, "own": own})
+	}
+	if err := rows.Err(); err != nil {
+		internalError(w, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -115,7 +139,13 @@ func (s *Server) revokeShare(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	result, err := s.db.Exec(r.Context(), `UPDATE public_shares SET revoked_at=now() WHERE id=$1 AND created_by=$2 AND revoked_at IS NULL`, id, a.UserID)
+	canAdministerFamilyShares := a.Role == "owner" || a.Role == "admin"
+	result, err := s.db.Exec(r.Context(), `
+		UPDATE public_shares s SET revoked_at=now()
+		WHERE s.id=$1 AND s.revoked_at IS NULL AND (s.created_by=$2 OR ($3 AND (
+			EXISTS (SELECT 1 FROM nodes n JOIN spaces sp ON sp.id=n.space_id WHERE s.resource_type IN ('file','folder') AND n.id=s.resource_id AND sp.kind='family' AND sp.household_id=$4)
+			OR EXISTS (SELECT 1 FROM albums al JOIN spaces sp ON sp.id=al.space_id WHERE s.resource_type='album' AND al.id=s.resource_id AND sp.kind='family' AND sp.household_id=$4)
+		)))`, id, a.UserID, canAdministerFamilyShares, a.HouseholdID)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -136,7 +166,7 @@ func (s *Server) unlockShare(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if len(token) > 256 || len([]rune(input.Password)) > 128 {
+	if !panAuth.ValidToken(token, 32) || len([]rune(input.Password)) > 128 {
 		writeError(w, http.StatusNotFound, "not_found", "分享不存在或已失效")
 		return
 	}
@@ -174,7 +204,7 @@ func chiParam(r *http.Request, name string) string {
 
 func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	plainToken := chiParam(r, "token")
-	shareID, resourceID, resourceType, allowDownload, access, err := s.validateShareAccess(r)
+	shareID, resourceID, resourceType, allowDownload, access, _, err := s.validateShareAccess(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "share_locked", "请先验证分享密码")
 		return
@@ -253,24 +283,56 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) validateShareAccess(r *http.Request) (uuid.UUID, uuid.UUID, string, bool, string, error) {
+func (s *Server) validateShareAccess(r *http.Request) (uuid.UUID, uuid.UUID, string, bool, string, actor, error) {
 	plainToken := chiParam(r, "token")
 	access := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if access == "" {
 		access = r.URL.Query().Get("access_token")
 	}
-	var shareID, resourceID uuid.UUID
+	if !panAuth.ValidToken(plainToken, 32) || !panAuth.ValidToken(access, 32) {
+		return uuid.Nil, uuid.Nil, "", false, "", actor{}, fmt.Errorf("invalid share token")
+	}
+	var shareID, resourceID, creatorID uuid.UUID
 	var resourceType string
 	var allowDownload bool
 	err := s.db.QueryRow(r.Context(), `
-		SELECT s.id,s.resource_type,s.resource_id,s.allow_download
+		SELECT s.id,s.resource_type,s.resource_id,s.allow_download,s.created_by
 		FROM public_shares s JOIN share_access_tokens a ON a.share_id=s.id
-		WHERE s.token_hash=$1 AND a.token_hash=$2 AND a.expires_at>now() AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>now())`, panAuth.TokenHash(plainToken), panAuth.TokenHash(access)).Scan(&shareID, &resourceType, &resourceID, &allowDownload)
-	return shareID, resourceID, resourceType, allowDownload, access, err
+		WHERE s.token_hash=$1 AND a.token_hash=$2 AND a.expires_at>now() AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>now())`, panAuth.TokenHash(plainToken), panAuth.TokenHash(access)).Scan(&shareID, &resourceType, &resourceID, &allowDownload, &creatorID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", false, "", actor{}, err
+	}
+	creator, err := s.actorForUser(r.Context(), creatorID)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", false, "", actor{}, err
+	}
+	var level int
+	if resourceType == "album" {
+		level, err = s.albumPermission(r.Context(), creator, resourceID)
+	} else {
+		level, err = s.nodePermission(r.Context(), creator, resourceID)
+	}
+	if err != nil || level < permissionManager {
+		if err == nil {
+			err = fmt.Errorf("share creator no longer manages resource")
+		}
+		return uuid.Nil, uuid.Nil, "", false, "", actor{}, err
+	}
+	if resourceType == "folder" {
+		var allowed bool
+		allowed, err = s.activeSubtreePermissionAtLeast(r.Context(), creator, resourceID, permissionViewer)
+		if err != nil || !allowed {
+			if err == nil {
+				err = fmt.Errorf("share subtree permission changed")
+			}
+			return uuid.Nil, uuid.Nil, "", false, "", actor{}, err
+		}
+	}
+	return shareID, resourceID, resourceType, allowDownload, access, creator, nil
 }
 
 func (s *Server) publicShareArchive(w http.ResponseWriter, r *http.Request) {
-	_, resourceID, resourceType, allowDownload, _, err := s.validateShareAccess(r)
+	_, resourceID, resourceType, allowDownload, _, _, err := s.validateShareAccess(r)
 	if err != nil || !allowDownload || resourceType == "file" {
 		writeError(w, http.StatusNotFound, "not_found", "下载不可用")
 		return

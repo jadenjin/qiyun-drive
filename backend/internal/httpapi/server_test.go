@@ -108,3 +108,31 @@ func TestPreviewableMIMEAllowlist(t *testing.T) {
 		}
 	}
 }
+
+func TestAdministrativeRoleBoundaries(t *testing.T) {
+	if !canInviteRole("owner", "admin") || !canInviteRole("admin", "member") {
+		t.Fatal("expected legitimate invitations to be allowed")
+	}
+	if canInviteRole("admin", "admin") || canInviteRole("member", "member") {
+		t.Fatal("administrator creation must remain owner-only")
+	}
+	if !canResetMemberRole("owner", "owner") || !canResetMemberRole("admin", "member") {
+		t.Fatal("expected legitimate resets to be allowed")
+	}
+	if canResetMemberRole("admin", "admin") || canResetMemberRole("admin", "owner") {
+		t.Fatal("administrators must not reset peer or owner credentials")
+	}
+}
+
+func TestUsernameValidation(t *testing.T) {
+	for _, username := range []string{"jaden", "family.member", "user_01", "a-b"} {
+		if !validUsername(username) {
+			t.Errorf("valid username rejected: %q", username)
+		}
+	}
+	for _, username := range []string{"", "ab", "with space", "管理员", "-leading", strings.Repeat("a", 65)} {
+		if validUsername(username) {
+			t.Errorf("invalid username accepted: %q", username)
+		}
+	}
+}

@@ -37,6 +37,20 @@ paths:
       security: [{ sessionCookie: [] }]
       responses:
         "200": { description: 密码已更新 }
+  /me/sessions:
+    get:
+      summary: 获取当前账户的有效登录会话
+      security: [{ sessionCookie: [] }]
+      responses:
+        "200": { description: 会话列表，包含当前会话标记 }
+  /me/sessions/{id}:
+    delete:
+      summary: 退出指定登录会话
+      security: [{ sessionCookie: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "204": { description: 会话已退出 }
   /spaces:
     get:
       summary: 获取当前成员可见空间

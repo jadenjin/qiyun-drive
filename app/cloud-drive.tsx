@@ -65,7 +65,9 @@ type PhotoItem = { nodeId: string; name: string; thumbUrl?: string; previewUrl?:
 type Album = { id: string; name: string; description: string; itemCount: number; createdAt: string; coverUrl?: string; permission?: string };
 type Member = { id: string; username: string; displayName: string; role: string; createdAt: string };
 type CurrentUser = { id: string; username: string; displayName: string; role: string; householdId: string };
-type ShareItem = { id: string; resourceType: string; resourceId: string; resourceName: string; hasPassword: boolean; allowDownload: boolean; expiresAt?: string; revokedAt?: string; createdAt: string };
+type ShareItem = { id: string; resourceType: string; resourceId: string; resourceName: string; hasPassword: boolean; allowDownload: boolean; expiresAt?: string; revokedAt?: string; createdAt: string; creatorName?: string; own?: boolean };
+type SessionItem = { id: string; current: boolean; createdAt: string; lastSeenAt: string; expiresAt: string };
+type CreatedActionLink = { title: string; description: string; url: string };
 type FolderOption = { id: string; parentId?: string; name: string; permission: string; updatedAt: string };
 type PermissionEntry = { userId: string; username?: string; displayName?: string; permission: "none" | "viewer" | "editor" | "manager" };
 type PermissionEditorState = { resourceType: "node" | "album"; id: string; name: string; inherit: boolean; entries: PermissionEntry[] };
@@ -164,6 +166,8 @@ export function CloudDrive() {
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
   const [accountOpen, setAccountOpen] = useState(false);
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [permissionGuideOpen, setPermissionGuideOpen] = useState(false);
   const [permissionEditor, setPermissionEditor] = useState<PermissionEditorState | null>(null);
@@ -173,6 +177,7 @@ export function CloudDrive() {
   const [trashNodes, setTrashNodes] = useState<TrashItem[]>([]);
   const [shareTarget, setShareTarget] = useState<{ id: string; kind: "file" | "folder" | "album"; name: string } | null>(null);
   const [createdShareURL, setCreatedShareURL] = useState("");
+  const [createdActionLink, setCreatedActionLink] = useState<CreatedActionLink | null>(null);
   const [currentParent, setCurrentParent] = useState<string | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<{ id: string | null; name: string }[]>([{ id: null, name: "我的空间" }]);
   const [grid, setGrid] = useState(false);
@@ -320,6 +325,8 @@ export function CloudDrive() {
     setPhotoViewer(null);
     setFilePreview(null);
     setCreatedShareURL("");
+    setCreatedActionLink(null);
+    setSessions([]);
     setMenuOpen(false);
     setAccountOpen(false);
     setNotificationsOpen(false);
@@ -371,6 +378,36 @@ export function CloudDrive() {
       setAccountDialogOpen(false);
       showToast("密码已更新，其他设备的会话已退出");
     } catch (error) { showToast(error instanceof Error ? error.message : "密码更新失败"); }
+  };
+
+  const openAccountSettings = async () => {
+    setAccountOpen(false);
+    setAccountDialogOpen(true);
+    if (status === "preview") {
+      const now = new Date().toISOString();
+      setSessions([{ id: "preview-session", current: true, createdAt: now, lastSeenAt: now, expiresAt: new Date(Date.now() + 30 * 86400000).toISOString() }]);
+      return;
+    }
+    setSessionsLoading(true);
+    try {
+      const result = await api<{ items: SessionItem[] }>("/me/sessions");
+      setSessions(result.items);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "无法加载登录设备");
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const revokeOwnSession = async (session: SessionItem) => {
+    if (session.current) return;
+    try {
+      await api(`/me/sessions/${session.id}`, { method: "DELETE" });
+      setSessions((items) => items.filter((item) => item.id !== session.id));
+      showToast("该登录会话已退出");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "退出会话失败");
+    }
   };
 
   const openFolder = (item: NodeItem) => {
@@ -661,7 +698,7 @@ export function CloudDrive() {
         const updated = await api<{ items: ShareItem[] }>("/shares");
         setShares(updated.items);
       } catch {
-        setShares((items) => [...items, { id: result.id, resourceType: shareTarget.kind, resourceId: shareTarget.id, resourceName: shareTarget.name, hasPassword: Boolean(options.password), allowDownload: options.allowDownload, expiresAt: expiresAt || undefined, createdAt: new Date().toISOString() }]);
+        setShares((items) => [...items, { id: result.id, resourceType: shareTarget.kind, resourceId: shareTarget.id, resourceName: shareTarget.name, hasPassword: Boolean(options.password), allowDownload: options.allowDownload, expiresAt: expiresAt || undefined, createdAt: new Date().toISOString(), creatorName: currentUser?.displayName, own: true }]);
       }
       try {
         await navigator.clipboard.writeText(result.url);
@@ -678,6 +715,37 @@ export function CloudDrive() {
       showToast("分享链接已复制");
     } catch {
       showToast("无法访问剪贴板，请选中链接手动复制");
+    }
+  };
+
+  const copyActionLink = async () => {
+    if (!createdActionLink) return;
+    try {
+      await navigator.clipboard.writeText(createdActionLink.url);
+      showToast("链接已复制");
+    } catch {
+      showToast("无法访问剪贴板，请选中链接手动复制");
+    }
+  };
+
+  const createInvitationLink = async (role: "member" | "admin") => {
+    if (status === "preview") {
+      setCreatedActionLink({ title: "邀请链接已创建", description: "链接 7 天内有效且只能使用一次。", url: "https://cloud.example/invite/preview-link" });
+      setDialog(null);
+      return;
+    }
+    try {
+      const result = await api<{ url: string }>("/invitations", { method: "POST", body: JSON.stringify({ role }) });
+      setCreatedActionLink({ title: "邀请链接已创建", description: `新成员将以${role === "admin" ? "家庭管理员" : "家庭成员"}身份加入；链接 7 天内有效且只能使用一次。`, url: result.url });
+      setDialog(null);
+      try {
+        await navigator.clipboard.writeText(result.url);
+        showToast("邀请链接已复制");
+      } catch {
+        showToast("邀请已创建，请在窗口中手动复制链接");
+      }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "邀请失败");
     }
   };
 
@@ -721,8 +789,13 @@ export function CloudDrive() {
   const createMemberPasswordReset = async (member: Member) => {
     try {
       const result = await api<{ url: string }>(`/members/${member.id}/password-reset`, { method: "POST" });
-      await navigator.clipboard.writeText(result.url);
-      showToast(`已复制 ${member.displayName} 的密码重置链接`);
+      setCreatedActionLink({ title: "密码重置链接已创建", description: `${member.displayName} 使用此链接后，旧会话和旧重置链接都会立即失效。链接 1 小时内有效。`, url: result.url });
+      try {
+        await navigator.clipboard.writeText(result.url);
+        showToast(`已复制 ${member.displayName} 的密码重置链接`);
+      } catch {
+        showToast("重置链接已创建，请在窗口中手动复制");
+      }
     } catch (error) { showToast(error instanceof Error ? error.message : "生成重置链接失败"); }
   };
 
@@ -767,7 +840,7 @@ export function CloudDrive() {
         <div className="nav-section-label">家庭</div>
         <nav className="side-nav"><button className={view === "family" ? "active" : ""} onClick={() => changeView("family")}><Users size={19} /><span>成员与权限</span></button></nav>
         <div className="storage-card"><div className="storage-head"><span><HardDrive size={16} /> 存储空间</span><strong>{Math.round(usedPercent)}%</strong></div><div className="storage-track"><span style={{ width: `${usedPercent}%` }} /></div><p>已用 {formatBytes(selectedSpace?.usedBytes || 0)}<br />共 {selectedSpace?.quotaBytes ? formatBytes(selectedSpace.quotaBytes) : "不限额"}</p></div>
-        <div className="profile-wrap"><button className="profile-row" onClick={() => setAccountOpen((value) => !value)}><span className="profile-avatar">{userInitial}</span><span><strong>{currentUser?.displayName || "访客"}</strong><small>{status === "preview" ? "界面预览" : roleLabel}</small></span><Settings size={17} /></button>{accountOpen && <div className="account-menu"><div><strong>{currentUser?.displayName}</strong><small>@{currentUser?.username}</small></div><button onClick={() => { setAccountOpen(false); setAccountDialogOpen(true); }}><UserRound size={15} /> 账户设置</button><button onClick={logout}><LogOut size={15} /> 退出登录</button></div>}</div>
+        <div className="profile-wrap"><button className="profile-row" onClick={() => setAccountOpen((value) => !value)}><span className="profile-avatar">{userInitial}</span><span><strong>{currentUser?.displayName || "访客"}</strong><small>{status === "preview" ? "界面预览" : roleLabel}</small></span><Settings size={17} /></button>{accountOpen && <div className="account-menu"><div><strong>{currentUser?.displayName}</strong><small>@{currentUser?.username}</small></div><button onClick={() => void openAccountSettings()}><UserRound size={15} /> 账户设置</button><button onClick={logout}><LogOut size={15} /> 退出登录</button></div>}</div>
       </aside>
 
       <main className="main-panel">
@@ -783,21 +856,22 @@ export function CloudDrive() {
           {view === "albums" && (selectedAlbum ? <AlbumDetail album={selectedAlbum} photos={albumPhotos.filter((item) => `${item.name} ${item.remark}`.toLowerCase().includes(search.toLowerCase()))} onBack={() => { setSelectedAlbum(null); setAlbumPhotos([]); }} onUpload={chooseAlbumPhotos} onOpen={(photo) => setPhotoViewer({ photo, albumId: selectedAlbum.id })} onEdit={setAlbumEditor} onPermissions={selectedSpace?.kind === "family" && selectedAlbum.permission === "manager" ? (album) => void openPermissionEditor("album", album.id, album.name) : undefined} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} onDelete={deleteAlbum} /> : <AlbumView albums={filteredAlbums} onOpen={openAlbum} onUpload={chooseAlbumPhotos} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} />)}
           {view === "shares" && <ShareView shares={status === "preview" ? undefined : shares} onRevoke={revokeShare} />}
           {view === "trash" && <TrashView nodes={status === "preview" ? previewNodes.slice(3, 5).map((item) => ({ ...item, deletedAt: new Date(Date.now() - 3 * 86400000).toISOString(), purgeAt: new Date(Date.now() + 27 * 86400000).toISOString() })) : trashNodes} onRestore={restoreTrashNode} onPurge={purgeTrashNode} onEmpty={emptyTrash} />}
-          {view === "family" && <FamilyView members={members} auditItems={auditItems} space={spaces.find((item) => item.kind === "family") || selectedSpace} canManage={currentUser?.role === "owner" || currentUser?.role === "admin"} canEditRoles={currentUser?.role === "owner"} canEditQuota={currentUser?.role === "owner"} onResetPassword={createMemberPasswordReset} onRoleChange={updateMemberRole} onPermissionGuide={() => setPermissionGuideOpen(true)} onEditQuota={(space) => setQuotaEditor(space)} />}
+          {view === "family" && <FamilyView members={members} auditItems={auditItems} space={spaces.find((item) => item.kind === "family") || selectedSpace} canManage={currentUser?.role === "owner" || currentUser?.role === "admin"} canEditRoles={currentUser?.role === "owner"} canEditQuota={currentUser?.role === "owner"} canResetMember={(member) => currentUser?.role === "owner" || member.role === "member"} onResetPassword={createMemberPasswordReset} onRoleChange={updateMemberRole} onPermissionGuide={() => setPermissionGuideOpen(true)} onEditQuota={(space) => setQuotaEditor(space)} />}
         </div>
       </main>
       <div className="mobile-nav">{navItems.slice(0, 4).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => changeView(item.id)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
       {uploads.length > 0 && <UploadTray tasks={uploads} onClose={() => setUploads((items) => items.filter((item) => item.state !== "ready"))} onPause={(id) => uploadControllers.current.get(id)?.abort()} onResume={resumeTask} />}
-      {dialog && <NameDialog type={dialog} onClose={() => setDialog(null)} onSubmit={createNamedItem} onInvite={async (role) => { if (status === "preview") { showToast("邀请链接已复制（界面预览）"); setDialog(null); return; } try { const result = await api<{ url: string }>("/invitations", { method: "POST", body: JSON.stringify({ role }) }); await navigator.clipboard.writeText(result.url); showToast("邀请链接已复制"); setDialog(null); } catch (error) { showToast(error instanceof Error ? error.message : "邀请失败"); } }} />}
+      {dialog && <NameDialog type={dialog} canInviteAdmin={currentUser?.role === "owner"} onClose={() => setDialog(null)} onSubmit={createNamedItem} onInvite={createInvitationLink} />}
       {shareTarget && <ShareDialog target={shareTarget} onClose={() => setShareTarget(null)} onSubmit={createShareLink} />}
       {createdShareURL && <ShareCreatedDialog url={createdShareURL} onClose={() => setCreatedShareURL("")} onCopy={copyCreatedShare} />}
+      {createdActionLink && <ActionLinkDialog value={createdActionLink} onClose={() => setCreatedActionLink(null)} onCopy={copyActionLink} />}
       {photoViewer && <PhotoViewer photo={photoViewer.photo} onClose={() => setPhotoViewer(null)} onSave={(remark) => savePhotoRemark(photoViewer.photo, remark)} onDownload={() => downloadPhoto(photoViewer.photo)} onRemove={photoViewer.albumId ? () => removePhotoFromAlbum(photoViewer.albumId!, photoViewer.photo.nodeId) : undefined} />}
       {filePreview && <FilePreviewDialog value={filePreview} onClose={() => setFilePreview(null)} onDownload={() => downloadNode(filePreview.item)} />}
       {albumEditor && <AlbumEditDialog album={albumEditor} onClose={() => setAlbumEditor(null)} onSubmit={(values) => updateAlbum(albumEditor, values)} />}
       {nodeEditor && <RenameDialog item={nodeEditor} onClose={() => setNodeEditor(null)} onSubmit={(name) => renameNode(nodeEditor, name)} />}
       {moveEditor && <MoveDialog items={moveEditor.items} folders={moveEditor.folders} rootName={selectedSpace?.name || "空间根目录"} onClose={() => setMoveEditor(null)} onSubmit={(parentId) => moveNodes(moveEditor.items, parentId)} />}
       {permissionEditor && <PermissionDialog value={permissionEditor} members={members} currentUserId={currentUser?.id} onClose={() => setPermissionEditor(null)} onSubmit={savePermissions} />}
-      {accountDialogOpen && currentUser && <AccountDialog user={currentUser} onClose={() => setAccountDialogOpen(false)} onProfile={updateProfile} onPassword={changeOwnPassword} />}
+      {accountDialogOpen && currentUser && <AccountDialog user={currentUser} sessions={sessions} sessionsLoading={sessionsLoading} onClose={() => setAccountDialogOpen(false)} onProfile={updateProfile} onPassword={changeOwnPassword} onRevokeSession={revokeOwnSession} />}
       {permissionGuideOpen && <PermissionGuideDialog onClose={() => setPermissionGuideOpen(false)} />}
       {quotaEditor && <QuotaDialog space={quotaEditor} onClose={() => setQuotaEditor(null)} onSubmit={(quotaBytes) => updateSpaceQuota(quotaEditor, quotaBytes)} />}
       {toast && <div className="toast"><ShieldCheck size={18} />{toast}</div>}
@@ -863,7 +937,7 @@ function ShareView({ shares: actualShares, onRevoke }: { shares?: ShareItem[]; o
   const active = items.filter((share) => !share.revokedAt && (!share.expiresAt || new Date(share.expiresAt).getTime() > referenceTime));
   const history = items.filter((share) => !active.includes(share));
   const shown = tab === "active" ? active : history;
-  return <section className="surface-card share-list"><div className="share-tabs"><button className={tab === "active" ? "active" : ""} onClick={() => setTab("active")}>有效分享 <span>{active.length}</span></button><button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>历史记录 <span>{history.length}</span></button></div><div className="share-header"><span>分享内容</span><span>访问设置</span><span>有效期</span><span /></div>{shown.map((share) => <div className="share-row" key={share.id}><span className="share-name"><span className="share-icon"><Link2 size={18} /></span><span><strong>{share.resourceName}</strong><small>{share.resourceType === "album" ? "相册" : share.resourceType === "folder" ? "文件夹" : "文件"}</small></span></span><span>{share.hasPassword ? <><ShieldCheck size={15} /> 密码保护</> : "无需密码"}</span><span>{share.revokedAt ? "已撤销" : share.expiresAt && new Date(share.expiresAt).getTime() <= referenceTime ? "已过期" : share.expiresAt ? relativeDate(share.expiresAt) + " 到期" : "长期有效"}</span><span>{tab === "active" ? <button className="text-button" onClick={() => onRevoke(share.id)}>撤销</button> : <span className="share-status">已失效</span>}</span></div>)}{!shown.length && <EmptyState icon={Link2} title={tab === "active" ? "还没有有效分享" : "暂无分享历史"} text={tab === "active" ? "从文件或相册中创建一条受密码和有效期保护的链接" : "撤销或过期的分享会保留在这里便于审计"} />}</section>;
+  return <section className="surface-card share-list"><div className="share-tabs"><button className={tab === "active" ? "active" : ""} onClick={() => setTab("active")}>有效分享 <span>{active.length}</span></button><button className={tab === "history" ? "active" : ""} onClick={() => setTab("history")}>历史记录 <span>{history.length}</span></button></div><div className="share-header"><span>分享内容</span><span>访问设置</span><span>有效期</span><span /></div>{shown.map((share) => <div className="share-row" key={share.id}><span className="share-name"><span className="share-icon"><Link2 size={18} /></span><span><strong>{share.resourceName}</strong><small>{share.resourceType === "album" ? "相册" : share.resourceType === "folder" ? "文件夹" : "文件"}{share.own === false && share.creatorName ? ` · ${share.creatorName} 创建` : ""}</small></span></span><span>{share.hasPassword ? <><ShieldCheck size={15} /> 密码保护</> : "无需密码"}</span><span>{share.revokedAt ? "已撤销" : share.expiresAt && new Date(share.expiresAt).getTime() <= referenceTime ? "已过期" : share.expiresAt ? relativeDate(share.expiresAt) + " 到期" : "长期有效"}</span><span>{tab === "active" ? <button className="text-button" onClick={() => onRevoke(share.id)}>撤销</button> : <span className="share-status">已失效</span>}</span></div>)}{!shown.length && <EmptyState icon={Link2} title={tab === "active" ? "还没有有效分享" : "暂无分享历史"} text={tab === "active" ? "从文件或相册中创建一条受密码和有效期保护的链接" : "撤销或过期的分享会保留在这里便于审计"} />}</section>;
 }
 
 function TrashView({ nodes, onRestore, onPurge, onEmpty }: { nodes: TrashItem[]; onRestore: (id: string) => void; onPurge: (id: string) => void; onEmpty: () => void }) {
@@ -894,6 +968,8 @@ function auditAction(item: AuditItem) {
     "share.create": "创建了对外分享",
     "share.revoke": "撤销了对外分享",
     "invitation.create": "创建了家庭邀请",
+    "member.password_reset_create": "创建了成员密码重置链接",
+    "account.session_revoke": "退出了一个登录会话",
     "member.role_update": "调整了成员角色",
     "account.profile_update": "更新了个人资料",
     "account.password_update": "更新了登录密码",
@@ -902,8 +978,8 @@ function auditAction(item: AuditItem) {
   return labels[item.action] || item.action.replaceAll(".", " · ");
 }
 
-function FamilyView({ members, auditItems, space, canManage, canEditRoles, canEditQuota, onResetPassword, onRoleChange, onPermissionGuide, onEditQuota }: { members: Member[]; auditItems: AuditItem[]; space?: Space; canManage: boolean; canEditRoles: boolean; canEditQuota: boolean; onResetPassword: (member: Member) => void; onRoleChange: (member: Member, role: "admin" | "member") => void; onPermissionGuide: () => void; onEditQuota: (space: Space) => void }) {
-  return <div className="family-layout"><div className="family-main"><section className="surface-card family-card"><div className="section-title"><div><h2>家庭成员</h2><p>管理员只能管理家庭空间，无法查看成员私有空间</p></div><span>{members.length} 人</span></div><div className="member-list">{members.map((member, index) => <div className="member-row" key={member.id}><span className={`member-avatar member-${index}`}>{member.displayName.slice(0, 1)}</span><span><strong>{member.displayName}{member.role === "owner" && <em>所有者</em>}</strong><small>@{member.username}</small></span>{canEditRoles && member.role !== "owner" ? <select className="member-role-select" value={member.role} onChange={(event) => onRoleChange(member, event.target.value as "admin" | "member")} aria-label={`设置 ${member.displayName} 的角色`}><option value="member">家庭成员</option><option value="admin">管理员</option></select> : <span className="member-role">{member.role === "owner" ? "完全管理" : member.role === "admin" ? "管理员" : "家庭成员"}</span>}{canManage ? <button onClick={() => onResetPassword(member)} title="生成密码重置链接" aria-label={`重置 ${member.displayName} 的密码`}><Settings size={17} /></button> : <span />}</div>)}</div></section>{canManage && <section className="surface-card audit-card"><div className="section-title"><div><h2>最近活动</h2><p>家庭空间的重要操作会记录在这里</p></div><span>最近 {auditItems.length} 条</span></div><div className="audit-list">{auditItems.slice(0, 12).map((item) => <article key={item.id}><span className="audit-dot" /><span><strong>{item.actorName || "系统"} {auditAction(item)}</strong><small>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}</small></span></article>)}{!auditItems.length && <p className="audit-empty">暂无活动记录</p>}</div></section>}</div><aside className="family-side"><section className="surface-card permission-card"><span className="permission-art"><ShieldCheck size={27} /></span><h3>隐私边界清晰可见</h3><p>个人文件默认只有本人能访问；放入家庭空间后，再按目录设置查看、编辑或管理权限。</p><button onClick={onPermissionGuide}>查看权限说明 <ChevronRight size={15} /></button></section><section className="surface-card quota-card"><div><span>家庭空间用量</span><strong>{formatBytes(space?.usedBytes || 0)}</strong>{canEditQuota && space && <button onClick={() => onEditQuota(space)}>设置配额</button>}</div><div className="quota-ring" style={{ "--quota": `${space?.quotaBytes ? (space.usedBytes / space.quotaBytes) * 360 : 90}deg` } as React.CSSProperties}><span>{space?.quotaBytes ? Math.round(space.usedBytes / space.quotaBytes * 100) : 0}%</span></div></section></aside></div>;
+function FamilyView({ members, auditItems, space, canManage, canEditRoles, canEditQuota, canResetMember, onResetPassword, onRoleChange, onPermissionGuide, onEditQuota }: { members: Member[]; auditItems: AuditItem[]; space?: Space; canManage: boolean; canEditRoles: boolean; canEditQuota: boolean; canResetMember: (member: Member) => boolean; onResetPassword: (member: Member) => void; onRoleChange: (member: Member, role: "admin" | "member") => void; onPermissionGuide: () => void; onEditQuota: (space: Space) => void }) {
+  return <div className="family-layout"><div className="family-main"><section className="surface-card family-card"><div className="section-title"><div><h2>家庭成员</h2><p>管理员只能管理家庭空间，无法查看成员私有空间</p></div><span>{members.length} 人</span></div><div className="member-list">{members.map((member, index) => <div className="member-row" key={member.id}><span className={`member-avatar member-${index}`}>{member.displayName.slice(0, 1)}</span><span><strong>{member.displayName}{member.role === "owner" && <em>所有者</em>}</strong><small>@{member.username}</small></span>{canEditRoles && member.role !== "owner" ? <select className="member-role-select" value={member.role} onChange={(event) => onRoleChange(member, event.target.value as "admin" | "member")} aria-label={`设置 ${member.displayName} 的角色`}><option value="member">家庭成员</option><option value="admin">管理员</option></select> : <span className="member-role">{member.role === "owner" ? "完全管理" : member.role === "admin" ? "管理员" : "家庭成员"}</span>}{canManage && canResetMember(member) ? <button onClick={() => onResetPassword(member)} title="生成密码重置链接" aria-label={`重置 ${member.displayName} 的密码`}><Settings size={17} /></button> : <span />}</div>)}</div></section>{canManage && <section className="surface-card audit-card"><div className="section-title"><div><h2>最近活动</h2><p>家庭空间的重要操作会记录在这里</p></div><span>最近 {auditItems.length} 条</span></div><div className="audit-list">{auditItems.slice(0, 12).map((item) => <article key={item.id}><span className="audit-dot" /><span><strong>{item.actorName || "系统"} {auditAction(item)}</strong><small>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(item.createdAt))}</small></span></article>)}{!auditItems.length && <p className="audit-empty">暂无活动记录</p>}</div></section>}</div><aside className="family-side"><section className="surface-card permission-card"><span className="permission-art"><ShieldCheck size={27} /></span><h3>隐私边界清晰可见</h3><p>个人文件默认只有本人能访问；放入家庭空间后，再按目录设置查看、编辑或管理权限。</p><button onClick={onPermissionGuide}>查看权限说明 <ChevronRight size={15} /></button></section><section className="surface-card quota-card"><div><span>家庭空间用量</span><strong>{formatBytes(space?.usedBytes || 0)}</strong>{canEditQuota && space && <button onClick={() => onEditQuota(space)}>设置配额</button>}</div><div className="quota-ring" style={{ "--quota": `${space?.quotaBytes ? (space.usedBytes / space.quotaBytes) * 360 : 90}deg` } as React.CSSProperties}><span>{space?.quotaBytes ? Math.round(space.usedBytes / space.quotaBytes * 100) : 0}%</span></div></section></aside></div>;
 }
 
 function UploadTray({ tasks, onClose, onPause, onResume }: { tasks: UploadTask[]; onClose: () => void; onPause: (id: string) => void; onResume: (id: string) => void }) {
@@ -977,7 +1053,7 @@ function PermissionDialog({ value, members, currentUserId, onClose, onSubmit }: 
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal permission-editor" onSubmit={(event) => { event.preventDefault(); onSubmit(draft); }}><div className="modal-icon"><ShieldCheck size={22} /></div><h2>设置「{value.name}」权限</h2><p>所有者和管理员始终拥有管理权限；可为普通家庭成员单独指定访问级别。</p><label className="checkbox-label permission-inherit"><input type="checkbox" checked={draft.inherit} onChange={(event) => setDraft((current) => ({ ...current, inherit: event.target.checked }))} />未单独设置的成员继承上级目录权限</label><div className="permission-members">{editableMembers.map((member) => <label key={member.id}><span className="member-avatar">{member.displayName.slice(0, 1)}</span><span><strong>{member.displayName}</strong><small>@{member.username}</small></span><select value={permissionFor(member.id)} onChange={(event) => setPermission(member, event.target.value as PermissionEntry["permission"])}><option value="none">不单独设置</option><option value="viewer">查看者</option><option value="editor">编辑者</option><option value="manager">管理者</option></select></label>)}{!editableMembers.length && <p className="permission-empty">暂无可单独配置的普通家庭成员。</p>}</div><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存权限</button></div></form></div>;
 }
 
-function AccountDialog({ user, onClose, onProfile, onPassword }: { user: CurrentUser; onClose: () => void; onProfile: (displayName: string) => void; onPassword: (currentPassword: string, newPassword: string) => void }) {
+function AccountDialog({ user, sessions, sessionsLoading, onClose, onProfile, onPassword, onRevokeSession }: { user: CurrentUser; sessions: SessionItem[]; sessionsLoading: boolean; onClose: () => void; onProfile: (displayName: string) => void; onPassword: (currentPassword: string, newPassword: string) => void; onRevokeSession: (session: SessionItem) => void }) {
   const [tab, setTab] = useState<"profile" | "security">("profile");
   const [displayName, setDisplayName] = useState(user.displayName);
   const [passwords, setPasswords] = useState({ current: "", next: "", confirm: "" });
@@ -989,7 +1065,7 @@ function AccountDialog({ user, onClose, onProfile, onPassword }: { user: Current
     setError("");
     onPassword(passwords.current, passwords.next);
   };
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal account-dialog" role="dialog" aria-modal="true" aria-label="账户设置"><div className="modal-icon">{tab === "profile" ? <UserRound size={22} /> : <KeyRound size={22} />}</div><h2>账户设置</h2><div className="account-tabs"><button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>个人资料</button><button className={tab === "security" ? "active" : ""} onClick={() => setTab("security")}>登录安全</button></div>{tab === "profile" ? <form onSubmit={(event) => { event.preventDefault(); if (displayName.trim()) onProfile(displayName.trim()); }}><label className="modal-label">用户名<input value={user.username} disabled /></label><label className="modal-label">显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={100} /></label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存资料</button></div></form> : <form onSubmit={submitPassword}><label className="modal-label">当前密码<input type="password" value={passwords.current} onChange={(event) => setPasswords({ ...passwords, current: event.target.value })} autoComplete="current-password" /></label><label className="modal-label">新密码<input type="password" value={passwords.next} onChange={(event) => setPasswords({ ...passwords, next: event.target.value })} autoComplete="new-password" placeholder="至少 10 个字符" /></label><label className="modal-label">确认新密码<input type="password" value={passwords.confirm} onChange={(event) => setPasswords({ ...passwords, confirm: event.target.value })} autoComplete="new-password" /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">更新密码</button></div></form>}</section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal account-dialog" role="dialog" aria-modal="true" aria-label="账户设置"><div className="modal-icon">{tab === "profile" ? <UserRound size={22} /> : <KeyRound size={22} />}</div><h2>账户设置</h2><div className="account-tabs"><button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>个人资料</button><button className={tab === "security" ? "active" : ""} onClick={() => setTab("security")}>登录安全</button></div>{tab === "profile" ? <form onSubmit={(event) => { event.preventDefault(); if (displayName.trim()) onProfile(displayName.trim()); }}><label className="modal-label">用户名<input value={user.username} disabled /></label><label className="modal-label">显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={100} /></label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存资料</button></div></form> : <div className="account-security"><form onSubmit={submitPassword}><label className="modal-label">当前密码<input type="password" value={passwords.current} onChange={(event) => setPasswords({ ...passwords, current: event.target.value })} autoComplete="current-password" /></label><label className="modal-label">新密码<input type="password" value={passwords.next} onChange={(event) => setPasswords({ ...passwords, next: event.target.value })} autoComplete="new-password" placeholder="至少 10 个字符" /></label><label className="modal-label">确认新密码<input type="password" value={passwords.confirm} onChange={(event) => setPasswords({ ...passwords, confirm: event.target.value })} autoComplete="new-password" /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">更新密码</button></div></form><section className="session-list" aria-label="登录设备"><div><strong>登录设备</strong><small>发现陌生会话时可立即退出</small></div>{sessionsLoading ? <p>正在加载…</p> : sessions.map((session) => <article key={session.id}><span><ShieldCheck size={17} /></span><span><strong>{session.current ? "当前设备" : `活跃于 ${relativeDate(session.lastSeenAt)}`}</strong><small>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(session.createdAt))} 登录</small></span>{session.current ? <em>当前</em> : <button type="button" onClick={() => onRevokeSession(session)}>退出</button>}</article>)}{!sessionsLoading && !sessions.length && <p>暂无有效登录会话</p>}</section></div>}</section></div>;
 }
 
 function PermissionGuideDialog({ onClose }: { onClose: () => void }) {
@@ -1005,17 +1081,32 @@ function ShareDialog({ target, onClose, onSubmit }: { target: { name: string }; 
   const [password, setPassword] = useState("");
   const [days, setDays] = useState(7);
   const [allowDownload, setAllowDownload] = useState(true);
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={(event) => { event.preventDefault(); onSubmit({ password, days, allowDownload }); }}><div className="modal-icon"><Share2 size={22} /></div><h2>分享「{target.name}」</h2><p>链接创建后只展示一次；复制给需要访问的人。</p><label className="modal-label">访问密码（可选）<input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="留空则无需密码" /></label><label className="modal-label">有效期<select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={1}>1 天</option><option value={7}>7 天</option><option value={30}>30 天</option><option value={0}>长期有效</option></select></label><label className="checkbox-label"><input type="checkbox" checked={allowDownload} onChange={(event) => setAllowDownload(event.target.checked)} />允许下载原文件</label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">创建并复制链接</button></div></form></div>;
+  const [error, setError] = useState("");
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const normalizedPassword = password.trim();
+    if (normalizedPassword && normalizedPassword.length < 4) {
+      setError("访问密码至少需要 4 个字符");
+      return;
+    }
+    setError("");
+    onSubmit({ password: normalizedPassword, days, allowDownload });
+  };
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={submit}><div className="modal-icon"><Share2 size={22} /></div><h2>分享「{target.name}」</h2><p>链接创建后只展示一次；复制给需要访问的人。</p><label className="modal-label">访问密码（可选）<input value={password} onChange={(event) => { setPassword(event.target.value); setError(""); }} placeholder="留空则无需密码，设置时至少 4 位" maxLength={128} /></label>{error && <p className="form-error">{error}</p>}<label className="modal-label">有效期<select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={1}>1 天</option><option value={7}>7 天</option><option value={30}>30 天</option><option value={0}>长期有效</option></select></label><label className="checkbox-label"><input type="checkbox" checked={allowDownload} onChange={(event) => setAllowDownload(event.target.checked)} />允许下载原文件</label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">创建并复制链接</button></div></form></div>;
 }
 
 function ShareCreatedDialog({ url, onClose, onCopy }: { url: string; onClose: () => void; onCopy: () => void }) {
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal share-created" role="dialog" aria-modal="true" aria-label="分享链接已创建"><div className="modal-icon"><Link2 size={22} /></div><h2>分享链接已创建</h2><p>出于安全考虑，这条链接只在这里展示一次。请复制保存后再关闭。</p><label className="modal-label">分享链接<input value={url} readOnly onFocus={(event) => event.currentTarget.select()} /></label><div className="share-created-actions"><button type="button" onClick={onCopy}><Copy size={16} /> 复制链接</button><a className="primary-button" href={url} target="_blank" rel="noreferrer"><ExternalLink size={16} /> 打开验证</a></div><div className="modal-actions"><button type="button" onClick={onClose}>完成</button></div></section></div>;
 }
 
-function NameDialog({ type, onClose, onSubmit, onInvite }: { type: "folder" | "album" | "invite"; onClose: () => void; onSubmit: (name: string) => void; onInvite: (role: "member" | "admin") => void }) {
+function ActionLinkDialog({ value, onClose, onCopy }: { value: CreatedActionLink; onClose: () => void; onCopy: () => void }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal share-created" role="dialog" aria-modal="true" aria-label={value.title}><div className="modal-icon"><Link2 size={22} /></div><h2>{value.title}</h2><p>{value.description}</p><label className="modal-label">一次性链接<input value={value.url} readOnly onFocus={(event) => event.currentTarget.select()} /></label><div className="share-created-actions"><button type="button" onClick={onCopy}><Copy size={16} /> 复制链接</button><a className="primary-button" href={value.url} target="_blank" rel="noreferrer"><ExternalLink size={16} /> 打开验证</a></div><div className="modal-actions"><button type="button" onClick={onClose}>完成</button></div></section></div>;
+}
+
+function NameDialog({ type, canInviteAdmin, onClose, onSubmit, onInvite }: { type: "folder" | "album" | "invite"; canInviteAdmin: boolean; onClose: () => void; onSubmit: (name: string) => void; onInvite: (role: "member" | "admin") => void }) {
   const [name, setName] = useState("");
   const [inviteRole, setInviteRole] = useState<"member" | "admin">("member");
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={(event) => { event.preventDefault(); if (type === "invite") onInvite(inviteRole); else onSubmit(name); }}><div className="modal-icon">{type === "folder" ? <Folder size={22} /> : type === "album" ? <Images size={22} /> : <UserPlus size={22} />}</div><h2>{type === "folder" ? "新建文件夹" : type === "album" ? "新建相册" : "邀请家庭成员"}</h2><p>{type === "invite" ? "将生成一个 7 天有效的一次性邀请链接。" : "给它取一个清晰、容易找到的名字。"}</p>{type !== "invite" ? <input value={name} onChange={(event) => setName(event.target.value)} placeholder={type === "folder" ? "文件夹名称" : "相册名称"} /> : <label className="modal-label">加入后的角色<select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "member" | "admin")}><option value="member">家庭成员</option><option value="admin">家庭管理员</option></select></label>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">{type === "invite" ? "生成并复制链接" : "创建"}</button></div></form></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal" onSubmit={(event) => { event.preventDefault(); if (type === "invite") onInvite(inviteRole); else onSubmit(name); }}><div className="modal-icon">{type === "folder" ? <Folder size={22} /> : type === "album" ? <Images size={22} /> : <UserPlus size={22} />}</div><h2>{type === "folder" ? "新建文件夹" : type === "album" ? "新建相册" : "邀请家庭成员"}</h2><p>{type === "invite" ? "将生成一个 7 天有效的一次性邀请链接。" : "给它取一个清晰、容易找到的名字。"}</p>{type !== "invite" ? <input value={name} onChange={(event) => setName(event.target.value)} placeholder={type === "folder" ? "文件夹名称" : "相册名称"} /> : <label className="modal-label">加入后的角色<select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as "member" | "admin")}><option value="member">家庭成员</option>{canInviteAdmin && <option value="admin">家庭管理员</option>}</select>{!canInviteAdmin && <small>只有家庭所有者可以邀请管理员</small>}</label>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">{type === "invite" ? "生成并复制链接" : "创建"}</button></div></form></div>;
 }
 
 function EmptyState({ icon: Icon, title, text }: { icon: typeof Folder; title: string; text: string }) {

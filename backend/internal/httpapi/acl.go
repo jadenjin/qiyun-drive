@@ -92,6 +92,14 @@ func (s *Server) setNodePermissions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "too_many_entries", "权限成员过多")
 		return
 	}
+	seen := make(map[uuid.UUID]struct{}, len(input.Entries))
+	for _, entry := range input.Entries {
+		if _, exists := seen[entry.UserID]; exists {
+			writeError(w, http.StatusBadRequest, "duplicate_member", "同一成员不能重复设置权限")
+			return
+		}
+		seen[entry.UserID] = struct{}{}
+	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
 		internalError(w, err)
@@ -153,6 +161,14 @@ func (s *Server) setAlbumPermissions(w http.ResponseWriter, r *http.Request) {
 	if len(input.Entries) > 100 {
 		writeError(w, http.StatusBadRequest, "too_many_entries", "权限成员过多")
 		return
+	}
+	seen := make(map[uuid.UUID]struct{}, len(input.Entries))
+	for _, entry := range input.Entries {
+		if _, exists := seen[entry.UserID]; exists {
+			writeError(w, http.StatusBadRequest, "duplicate_member", "同一成员不能重复设置权限")
+			return
+		}
+		seen[entry.UserID] = struct{}{}
 	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {

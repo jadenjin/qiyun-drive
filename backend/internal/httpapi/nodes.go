@@ -318,6 +318,15 @@ func (s *Server) trashNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "资源不存在")
 		return
 	}
+	allowed, err := s.subtreePermissionAtLeast(r.Context(), a, id, permissionEditor)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "subtree_forbidden", "目录中包含你无权删除的内容")
+		return
+	}
 	_, err = s.db.Exec(r.Context(), `
 		WITH RECURSIVE tree AS (
 		  SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NULL
@@ -425,6 +434,15 @@ func (s *Server) purgeNode(w http.ResponseWriter, r *http.Request) {
 	level, err := s.nodePermission(r.Context(), a, id)
 	if err != nil || level < permissionEditor {
 		writeError(w, http.StatusNotFound, "not_found", "资源不存在")
+		return
+	}
+	allowed, err := s.subtreePermissionAtLeast(r.Context(), a, id, permissionEditor)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, "subtree_forbidden", "目录中包含你无权永久删除的内容")
 		return
 	}
 	if _, err := s.db.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'purge_node',jsonb_build_object('nodeId',$2::text))`, uuid.New(), id.String()); err != nil {
