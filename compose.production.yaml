@@ -1,0 +1,9 @@
+services:
+  minio:
+    image: qiyun-minio:${MINIO_SOURCE_VERSION:-RELEASE.2025-10-15T17-29-55Z}
+    build:
+      context: .
+      dockerfile: deploy/Minio.Dockerfile
+      args:
+        MINIO_VERSION: ${MINIO_SOURCE_VERSION:-RELEASE.2025-10-15T17-29-55Z}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}

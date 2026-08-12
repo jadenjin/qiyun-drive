@@ -122,3 +122,34 @@ test("drive UI exposes complete album, file-management, permission, and account 
   const deleteAsset = worker.indexOf("DELETE FROM assets WHERE id=$1", deleteNode);
   assert.ok(deleteNode >= 0 && deleteAsset > deleteNode, "purge must delete the node tree before its assets");
 });
+
+test("release artifacts enforce health, isolation, recovery, and CI checks", async () => {
+  const [compose, production, backendDockerfile, minioDockerfile, operations, backup, workflow, config, packageJson] = await Promise.all([
+    readFile(new URL("compose.yaml", root), "utf8"),
+    readFile(new URL("compose.production.yaml", root), "utf8"),
+    readFile(new URL("backend/Dockerfile", root), "utf8"),
+    readFile(new URL("deploy/Minio.Dockerfile", root), "utf8"),
+    readFile(new URL("docs/operations.md", root), "utf8"),
+    readFile(new URL("scripts/backup.ps1", root), "utf8"),
+    readFile(new URL(".github/workflows/ci.yml", root), "utf8"),
+    readFile(new URL("backend/internal/config/config.go", root), "utf8"),
+    readFile(new URL("package.json", root), "utf8"),
+  ]);
+  assert.match(compose, /minio-ready:[\s\S]*service_completed_successfully/);
+  assert.match(compose, /POSTGRES_BIND_ADDRESS:-127\.0\.0\.1/);
+  assert.match(compose, /MINIO_BIND_ADDRESS:-127\.0\.0\.1/);
+  assert.match(compose, /worker:[\s\S]*api:[\s\S]*service_healthy/);
+  assert.match(production, /deploy\/Minio\.Dockerfile/);
+  assert.match(production, /RELEASE\.2025-10-15T17-29-55Z/);
+  assert.match(backendDockerfile, /USER pan/);
+  assert.match(minioDockerfile, /git clone[\s\S]*minio\/minio\.git/);
+  assert.match(operations, /health\/ready/);
+  assert.match(operations, /backup\.ps1/);
+  assert.match(backup, /pg_dump/);
+  assert.match(backup, /SHA256/);
+  assert.match(backup, /runningServices[\s\S]*servicesToResume/);
+  assert.match(workflow, /PAN_LIVE_INTEGRATION:[\s\S]*TestLiveAccountAndAuthorizationBoundaries/);
+  assert.match(workflow, /docker compose config --quiet/);
+  assert.match(config, /PUBLIC_BASE_URL must use HTTPS outside localhost/);
+  assert.equal(JSON.parse(packageJson).scripts.check, "npm run lint && npm test");
+});

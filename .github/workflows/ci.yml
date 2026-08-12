@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: backend/go.sum
+      - run: go test ./...
+      - run: go vet ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: backend/go.sum
+      - name: Validate Compose configuration
+        env:
+          POSTGRES_PASSWORD: integration-postgres-password
+          MINIO_ROOT_PASSWORD: integration-minio-password
+          PUBLIC_BASE_URL: http://localhost:3000
+          COOKIE_SECURE: 'false'
+        run: docker compose config --quiet
+      - name: Start disposable dependencies
+        env:
+          POSTGRES_PASSWORD: integration-postgres-password
+          MINIO_ROOT_PASSWORD: integration-minio-password
+          PUBLIC_BASE_URL: http://localhost:3000
+          COOKIE_SECURE: 'false'
+        run: |
+          docker compose up -d postgres minio minio-ready
+          docker compose wait minio-ready
+      - name: Start API
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://pan:integration-postgres-password@localhost:5432/pan?sslmode=disable
+          PUBLIC_BASE_URL: http://localhost:3000
+          ALLOWED_ORIGIN: http://localhost:3000
+          COOKIE_SECURE: 'false'
+          S3_ENDPOINT: http://localhost:9000
+          S3_PUBLIC_ENDPOINT: http://localhost:9000
+          S3_ACCESS_KEY: panminio
+          S3_SECRET_KEY: integration-minio-password
+          S3_BUCKET: pan-objects
+        run: |
+          go build -o ../pan-api-integration ./cmd/api
+          nohup ../pan-api-integration > ../api-integration.log 2>&1 &
+          echo $! > ../api-integration.pid
+          for i in $(seq 1 60); do curl --fail --silent http://localhost:8080/health/ready && exit 0; sleep 2; done
+          cat ../api-integration.log
+          exit 1
+      - name: Run live authorization and storage tests
+        working-directory: backend
+        env:
+          PAN_LIVE_INTEGRATION: '1'
+          PAN_API_URL: http://localhost:8080/api/v1
+          DATABASE_URL: postgres://pan:integration-postgres-password@localhost:5432/pan?sslmode=disable
+        run: go test ./internal/httpapi -run TestLiveAccountAndAuthorizationBoundaries -v -count=1
+      - name: Show service logs on failure
+        if: failure()
+        env:
+          POSTGRES_PASSWORD: integration-postgres-password
+          MINIO_ROOT_PASSWORD: integration-minio-password
+          PUBLIC_BASE_URL: http://localhost:3000
+          COOKIE_SECURE: 'false'
+        run: |
+          cat api-integration.log || true
+          docker compose logs --no-color postgres minio minio-ready
+      - name: Stop disposable dependencies
+        if: always()
+        env:
+          POSTGRES_PASSWORD: integration-postgres-password
+          MINIO_ROOT_PASSWORD: integration-minio-password
+          PUBLIC_BASE_URL: http://localhost:3000
+          COOKIE_SECURE: 'false'
+        run: |
+          if [ -f api-integration.pid ]; then kill "$(cat api-integration.pid)" || true; fi
+          docker compose down -v
