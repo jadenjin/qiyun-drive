@@ -50,19 +50,19 @@ jobs:
       - name: Validate Compose configuration
         env:
           POSTGRES_PASSWORD: integration-postgres-password
-          MINIO_ROOT_PASSWORD: integration-minio-password
+          RUSTFS_SECRET_KEY: integration-rustfs-password
           PUBLIC_BASE_URL: http://localhost:3000
           COOKIE_SECURE: 'false'
         run: docker compose config --quiet
       - name: Start disposable dependencies
         env:
           POSTGRES_PASSWORD: integration-postgres-password
-          MINIO_ROOT_PASSWORD: integration-minio-password
+          RUSTFS_SECRET_KEY: integration-rustfs-password
           PUBLIC_BASE_URL: http://localhost:3000
           COOKIE_SECURE: 'false'
         run: |
-          docker compose up -d postgres minio minio-ready
-          docker compose wait minio-ready
+          docker compose up -d postgres rustfs
+          docker compose wait rustfs
       - name: Start API
         working-directory: backend
         env:
@@ -72,8 +72,8 @@ jobs:
           COOKIE_SECURE: 'false'
           S3_ENDPOINT: http://localhost:9000
           S3_PUBLIC_ENDPOINT: http://localhost:9000
-          S3_ACCESS_KEY: panminio
-          S3_SECRET_KEY: integration-minio-password
+          S3_ACCESS_KEY: qiyun
+          S3_SECRET_KEY: integration-rustfs-password
           S3_BUCKET: pan-objects
         run: |
           go build -o ../pan-api-integration ./cmd/api
@@ -93,17 +93,17 @@ jobs:
         if: failure()
         env:
           POSTGRES_PASSWORD: integration-postgres-password
-          MINIO_ROOT_PASSWORD: integration-minio-password
+          RUSTFS_SECRET_KEY: integration-rustfs-password
           PUBLIC_BASE_URL: http://localhost:3000
           COOKIE_SECURE: 'false'
         run: |
           cat api-integration.log || true
-          docker compose logs --no-color postgres minio minio-ready
+          docker compose logs --no-color postgres rustfs
       - name: Stop disposable dependencies
         if: always()
         env:
           POSTGRES_PASSWORD: integration-postgres-password
-          MINIO_ROOT_PASSWORD: integration-minio-password
+          RUSTFS_SECRET_KEY: integration-rustfs-password
           PUBLIC_BASE_URL: http://localhost:3000
           COOKIE_SECURE: 'false'
         run: |

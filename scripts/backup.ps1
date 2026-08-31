@@ -44,10 +44,10 @@ try {
   }
 
   Invoke-DockerToFile -Arguments @("compose", "exec", "-T", "postgres", "pg_dump", "-U", "pan", "-d", "pan", "-Fc", "--no-owner", "--no-privileges") -OutputPath (Join-Path $resolvedBackup "postgres.dump")
-  & docker run --rm --entrypoint sh -v "qiyun-drive_minio_data:/source:ro" -v "${resolvedBackup}:/backup" postgres:17-alpine -c "tar -C /source -czf /backup/minio-data.tar.gz ."
-  if ($LASTEXITCODE -ne 0) { throw "无法备份 MinIO 数据卷" }
+  & docker run --rm --entrypoint sh -v "qiyun-drive_rustfs_data:/source:ro" -v "${resolvedBackup}:/backup" postgres:17-alpine -c "tar -C /source -czf /backup/rustfs-data.tar.gz ."
+  if ($LASTEXITCODE -ne 0) { throw "无法备份 RustFS 数据卷" }
 
-  $files = @("postgres.dump", "minio-data.tar.gz") | ForEach-Object {
+  $files = @("postgres.dump", "rustfs-data.tar.gz") | ForEach-Object {
     $itemPath = Join-Path $resolvedBackup $_
     $item = Get-Item -LiteralPath $itemPath
     [ordered]@{ name = $_; bytes = $item.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $itemPath).Hash.ToLowerInvariant() }

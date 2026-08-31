@@ -8,6 +8,8 @@ export type UploadTask = {
   error?: string;
 };
 
+export type UploadSection = "files" | "photos";
+
 type UploadSession = {
   id: string;
   nodeId: string;
@@ -166,6 +168,7 @@ export async function uploadFile(
     parentId: string | null;
     batchId?: string;
     albumId?: string;
+    section?: UploadSection;
     resumeKey?: string;
     signal: AbortSignal;
     onProgress: (value: number) => void;
@@ -182,6 +185,7 @@ export async function uploadFile(
       sizeBytes: file.size,
       mimeType: file.type || "application/octet-stream",
       conflictPolicy: "keep_both",
+      section: options.section || "files",
     }),
     signal: options.signal,
   });
@@ -222,7 +226,7 @@ export async function uploadFile(
             partProgress.set(partNumber, loaded);
             updateProgress();
           });
-          if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 MinIO CORS 配置");
+          if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 RustFS CORS 配置");
           partProgress.set(partNumber, blob.size);
           return { partNumber, etag };
         }),
@@ -281,12 +285,12 @@ export async function resumeMultipartUpload(
         const offset = (partNumber - 1) * partSize;
         const blob = file.slice(offset, Math.min(file.size, offset + partSize));
         const etag = await putBlob(url, blob, file.type, signal, (loaded) => { partProgress.set(partNumber, loaded); updateProgress(); });
-        if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 MinIO CORS 配置");
+        if (!etag) throw new Error("对象存储未返回分片校验标识，请检查 RustFS CORS 配置");
         partProgress.set(partNumber, blob.size);
         return { partNumber, etag };
       }));
       completed.push(...results);
-      await saveResumeState(key, { session: activeSession, file, parts: completed, partSize, updatedAt: Date.now() });
+      await saveResumeState(key, { ...resumable, session: activeSession, file, parts: completed, partSize, updatedAt: Date.now() });
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);

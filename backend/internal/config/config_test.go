@@ -9,8 +9,8 @@ func validConfig() Config {
 	return Config{
 		Addr: ":8080", DatabaseURL: "postgres://pan:secret@postgres:5432/pan?sslmode=disable",
 		PublicBaseURL: "https://cloud.example.com", AllowedOrigin: "https://cloud.example.com",
-		CookieSecure: true, S3Endpoint: "http://minio:9000", S3PublicEndpoint: "https://objects.example.com",
-		S3AccessKey: "panminio", S3SecretKey: "a-long-storage-secret", S3Bucket: "pan-objects",
+		CookieSecure: true, S3Endpoint: "http://rustfs:9000", S3PublicEndpoint: "https://objects.example.com",
+		S3AccessKey: "qiyun", S3SecretKey: "a-long-storage-secret", S3Bucket: "pan-objects",
 		PresignTTL: 15 * time.Minute, UploadTTL: 24 * time.Hour, TrashRetention: 30 * 24 * time.Hour,
 	}
 }
@@ -59,6 +59,16 @@ func TestValidateAcceptsLocalHTTPConfiguration(t *testing.T) {
 	cfg := validConfig()
 	cfg.PublicBaseURL = "http://127.0.0.1:3000"
 	cfg.AllowedOrigin = "http://127.0.0.1:3000"
+	cfg.CookieSecure = false
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateAcceptsPrivateNetworkHTTPConfiguration(t *testing.T) {
+	cfg := validConfig()
+	cfg.PublicBaseURL = "http://192.168.1.3"
+	cfg.AllowedOrigin = "http://192.168.1.3"
 	cfg.CookieSecure = false
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)

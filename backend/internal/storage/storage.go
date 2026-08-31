@@ -16,10 +16,11 @@ import (
 )
 
 type Store struct {
-	client *s3.Client
-	signer *s3.PresignClient
-	bucket string
-	ttl    time.Duration
+	client        *s3.Client
+	signer        *s3.PresignClient
+	bucket        string
+	allowedOrigin string
+	ttl           time.Duration
 }
 
 type CompletedPart struct {
@@ -44,14 +45,28 @@ func New(cfg config.Config) *Store {
 			UsePathStyle: true,
 		})
 	}
-	return &Store{client: client, signer: s3.NewPresignClient(publicClient), bucket: cfg.S3Bucket, ttl: cfg.PresignTTL}
+	return &Store{
+		client: client, signer: s3.NewPresignClient(publicClient), bucket: cfg.S3Bucket,
+		allowedOrigin: cfg.AllowedOrigin, ttl: cfg.PresignTTL,
+	}
 }
 
 func (s *Store) EnsureBucket(ctx context.Context) error {
-	if _, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)}); err == nil {
-		return nil
+	if _, err := s.client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.bucket)}); err != nil {
+		if _, err := s.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s.bucket)}); err != nil {
+			return err
+		}
 	}
-	_, err := s.client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s.bucket)})
+	_, err := s.client.PutBucketCors(ctx, &s3.PutBucketCorsInput{
+		Bucket: aws.String(s.bucket),
+		CORSConfiguration: &types.CORSConfiguration{CORSRules: []types.CORSRule{{
+			AllowedHeaders: []string{"*"},
+			AllowedMethods: []string{"GET", "PUT", "POST", "HEAD"},
+			AllowedOrigins: []string{s.allowedOrigin},
+			ExposeHeaders:  []string{"ETag", "x-amz-request-id"},
+			MaxAgeSeconds:  aws.Int32(3600),
+		}}},
+	})
 	return err
 }
 

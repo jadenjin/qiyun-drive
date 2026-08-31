@@ -35,10 +35,12 @@ type uploadRecord struct {
 	UserID       uuid.UUID
 	SpaceID      uuid.UUID
 	ObjectKey    string
+	MimeType     string
 	UploadID     *string
 	Method       string
 	ExpectedSize int64
 	State        string
+	Section      string
 	ExpiresAt    time.Time
 }
 
@@ -127,7 +129,7 @@ func (s *Server) ensureFolderPath(ctx context.Context, tx pgx.Tx, a actor, space
 	for _, name := range parts {
 		var id uuid.UUID
 		var kind string
-		err := tx.QueryRow(ctx, `SELECT id,kind FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL`, spaceID, current, name).Scan(&id, &kind)
+		err := tx.QueryRow(ctx, `SELECT id,kind FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND section='files' AND lower(name)=lower($3) AND deleted_at IS NULL`, spaceID, current, name).Scan(&id, &kind)
 		if err == pgx.ErrNoRows {
 			id = uuid.New()
 			if _, err := tx.Exec(ctx, `INSERT INTO nodes(id,space_id,parent_id,kind,name,created_by) VALUES($1,$2,$3,'folder',$4,$5)`, id, spaceID, current, name, a.UserID); err != nil {
@@ -159,6 +161,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		SizeBytes    int64      `json:"sizeBytes"`
 		MimeType     string     `json:"mimeType"`
 		Conflict     string     `json:"conflictPolicy"`
+		Section      string     `json:"section"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -181,6 +184,23 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		input.MimeType = "application/octet-stream"
 	}
 	input.MimeType = inferMimeType(name, input.MimeType)
+	if input.Section == "" {
+		input.Section = "files"
+	}
+	if input.Section != "files" && input.Section != "photos" {
+		writeError(w, http.StatusBadRequest, "invalid_section", "上传区域不合法")
+		return
+	}
+	if input.Section == "photos" {
+		if input.ParentID != nil || input.RelativePath != "" && strings.ContainsAny(input.RelativePath, `/\\`) {
+			writeError(w, http.StatusBadRequest, "invalid_photo_path", "照片不能上传到文件目录")
+			return
+		}
+		if !isPhotoMime(input.MimeType) {
+			writeError(w, http.StatusBadRequest, "invalid_photo_type", "照片区域只支持图片文件")
+			return
+		}
+	}
 	var directories []string
 	if input.RelativePath != "" {
 		parts, err := cleanRelativePath(input.RelativePath)
@@ -241,7 +261,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	name, err = s.resolveConflict(r.Context(), tx, a, input.SpaceID, parentID, name, input.Conflict)
+	name, err = s.resolveConflict(r.Context(), tx, a, input.SpaceID, parentID, input.Section, name, input.Conflict)
 	if err != nil {
 		if err.Error() == "conflict" {
 			writeError(w, http.StatusConflict, "name_conflict", "目标目录存在同名文件")
@@ -254,7 +274,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `INSERT INTO assets(id,space_id,object_key,size_bytes,mime_type,status,created_by) VALUES($1,$2,$3,$4,$5,'pending',$6)`, assetID, input.SpaceID, objectKey, input.SizeBytes, input.MimeType, a.UserID)
 	}
 	if err == nil {
-		_, err = tx.Exec(r.Context(), `INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,created_by) VALUES($1,$2,$3,$4,'file',$5,$6)`, nodeID, input.SpaceID, parentID, assetID, name, a.UserID)
+		_, err = tx.Exec(r.Context(), `INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,section,created_by) VALUES($1,$2,$3,$4,'file',$5,$6,$7)`, nodeID, input.SpaceID, parentID, assetID, name, input.Section, a.UserID)
 	}
 	if err == nil {
 		_, err = tx.Exec(r.Context(), `INSERT INTO upload_sessions(id,batch_id,asset_id,node_id,user_id,method,expected_size,state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,'uploading',$8)`, sessionID, input.BatchID, assetID, nodeID, a.UserID, method, input.SizeBytes, expires)
@@ -305,10 +325,10 @@ func choosePartSize(size int64) int64 {
 	return minimum
 }
 
-func (s *Server) resolveConflict(ctx context.Context, tx pgx.Tx, a actor, spaceID uuid.UUID, parentID *uuid.UUID, name, policy string) (string, error) {
+func (s *Server) resolveConflict(ctx context.Context, tx pgx.Tx, a actor, spaceID uuid.UUID, parentID *uuid.UUID, section, name, policy string) (string, error) {
 	var existingID uuid.UUID
 	var existingKind string
-	err := tx.QueryRow(ctx, `SELECT id,kind FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL`, spaceID, parentID, name).Scan(&existingID, &existingKind)
+	err := tx.QueryRow(ctx, `SELECT id,kind FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND section=$3 AND lower(name)=lower($4) AND deleted_at IS NULL`, spaceID, parentID, section, name).Scan(&existingID, &existingKind)
 	if err == pgx.ErrNoRows {
 		return name, nil
 	}
@@ -334,7 +354,7 @@ func (s *Server) resolveConflict(ctx context.Context, tx pgx.Tx, a actor, spaceI
 		for i := 1; i < 10000; i++ {
 			candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
 			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL)`, spaceID, parentID, candidate).Scan(&exists); err != nil {
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND section=$3 AND lower(name)=lower($4) AND deleted_at IS NULL)`, spaceID, parentID, section, candidate).Scan(&exists); err != nil {
 				return "", err
 			}
 			if !exists {
@@ -370,9 +390,9 @@ func (s *Server) failUpload(ctx context.Context, sessionID, assetID, spaceID uui
 func (s *Server) getUpload(ctx context.Context, id, userID uuid.UUID) (uploadRecord, error) {
 	var item uploadRecord
 	err := s.db.QueryRow(ctx, `
-		SELECT u.id,u.asset_id,u.node_id,u.user_id,a.space_id,a.object_key,u.upload_id,u.method,u.expected_size,u.state,u.expires_at
-		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id
-		WHERE u.id=$1 AND u.user_id=$2`, id, userID).Scan(&item.ID, &item.AssetID, &item.NodeID, &item.UserID, &item.SpaceID, &item.ObjectKey, &item.UploadID, &item.Method, &item.ExpectedSize, &item.State, &item.ExpiresAt)
+		SELECT u.id,u.asset_id,u.node_id,u.user_id,a.space_id,a.object_key,a.mime_type,u.upload_id,u.method,u.expected_size,u.state,n.section,u.expires_at
+		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id JOIN nodes n ON n.id=u.node_id
+		WHERE u.id=$1 AND u.user_id=$2`, id, userID).Scan(&item.ID, &item.AssetID, &item.NodeID, &item.UserID, &item.SpaceID, &item.ObjectKey, &item.MimeType, &item.UploadID, &item.Method, &item.ExpectedSize, &item.State, &item.Section, &item.ExpiresAt)
 	return item, err
 }
 
@@ -524,16 +544,20 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if result.RowsAffected() > 0 {
-		if mime == "" {
-			mime = "application/octet-stream"
+		effectiveMime := upload.MimeType
+		if effectiveMime == "" || strings.EqualFold(strings.Split(effectiveMime, ";")[0], "application/octet-stream") {
+			effectiveMime = mime
 		}
-		if _, err = tx.Exec(r.Context(), `UPDATE assets SET status='ready',size_bytes=$1,mime_type=COALESCE(NULLIF(mime_type,'application/octet-stream'),$2) WHERE id=$3`, actualSize, mime, upload.AssetID); err == nil {
+		if effectiveMime == "" {
+			effectiveMime = "application/octet-stream"
+		}
+		if _, err = tx.Exec(r.Context(), `UPDATE assets SET status='ready',size_bytes=$1,mime_type=$2 WHERE id=$3`, actualSize, effectiveMime, upload.AssetID); err == nil {
 			_, err = tx.Exec(r.Context(), `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1),used_bytes=used_bytes+$2 WHERE id=$3`, upload.ExpectedSize, actualSize, upload.SpaceID)
 		}
-		if err == nil && isPhotoMime(mime) {
+		if err == nil && shouldIndexPhoto(upload.Section, effectiveMime) {
 			_, err = tx.Exec(r.Context(), `INSERT INTO photo_details(asset_id) VALUES($1) ON CONFLICT DO NOTHING`, upload.AssetID)
 		}
-		if err == nil && isPhotoMime(mime) {
+		if err == nil && shouldIndexPhoto(upload.Section, effectiveMime) {
 			_, err = tx.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'index_photo',jsonb_build_object('assetId',$2::text))`, uuid.New(), upload.AssetID.String())
 		}
 		if err == nil {
@@ -562,6 +586,10 @@ func isPhotoMime(mime string) bool {
 	default:
 		return false
 	}
+}
+
+func shouldIndexPhoto(section, mime string) bool {
+	return section == "photos" && isPhotoMime(mime)
 }
 
 func inferMimeType(name, provided string) string {

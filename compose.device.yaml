@@ -1,0 +1,11 @@
+# Armbian/device deployment: keep Qiyun's RustFS isolated on the mounted data disk.
+# Ports 9100/9101 avoid conflicts with an existing host RustFS on 9000/9001.
+services:
+  rustfs:
+    ports: !override
+      - "${RUSTFS_BIND_ADDRESS:-0.0.0.0}:9100:9000"
+      - "127.0.0.1:9101:9001"
+    volumes: !override
+      # This is a separate ext4 loop mount backed by the mechanical disk.
+      # The existing host RustFS sees only the image file, never this data tree.
+      - /srv/qiyun-drive-rustfs:/data

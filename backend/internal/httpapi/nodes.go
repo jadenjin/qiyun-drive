@@ -97,7 +97,7 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(), `
 		SELECT n.id,n.space_id,n.parent_id,n.asset_id,n.kind,n.name,COALESCE(a.size_bytes,0),COALESCE(a.mime_type,''),COALESCE(a.status,'ready'),n.created_at,n.updated_at
 		FROM nodes n LEFT JOIN assets a ON a.id=n.asset_id
-		WHERE n.space_id=$1 AND n.parent_id IS NOT DISTINCT FROM $2 AND n.deleted_at IS NULL
+		WHERE n.space_id=$1 AND n.parent_id IS NOT DISTINCT FROM $2 AND n.section='files' AND n.deleted_at IS NULL
 		AND (n.kind='folder' OR a.status IN ('pending','ready'))
 		ORDER BY CASE n.kind WHEN 'folder' THEN 0 ELSE 1 END, lower(n.name)`, spaceID, parentID)
 	if err != nil {
@@ -415,9 +415,9 @@ func (s *Server) restoreNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var spaceID uuid.UUID
-	var name string
+	var name, section string
 	var originalParent *uuid.UUID
-	if err := s.db.QueryRow(r.Context(), `SELECT space_id,name,original_parent_id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL`, id).Scan(&spaceID, &name, &originalParent); err != nil {
+	if err := s.db.QueryRow(r.Context(), `SELECT space_id,name,section,original_parent_id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL`, id).Scan(&spaceID, &name, &section, &originalParent); err != nil {
 		dbNotFound(w, err)
 		return
 	}
@@ -435,7 +435,7 @@ func (s *Server) restoreNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "资源不存在")
 		return
 	}
-	name, err = s.availableName(r.Context(), spaceID, originalParent, name)
+	name, err = s.availableName(r.Context(), spaceID, originalParent, section, name)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -487,9 +487,9 @@ func (s *Server) purgeNode(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (s *Server) availableName(ctx context.Context, spaceID uuid.UUID, parentID *uuid.UUID, wanted string) (string, error) {
+func (s *Server) availableName(ctx context.Context, spaceID uuid.UUID, parentID *uuid.UUID, section, wanted string) (string, error) {
 	var exists bool
-	if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL)`, spaceID, parentID, wanted).Scan(&exists); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND section=$3 AND lower(name)=lower($4) AND deleted_at IS NULL)`, spaceID, parentID, section, wanted).Scan(&exists); err != nil {
 		return "", err
 	}
 	if !exists {
@@ -499,7 +499,7 @@ func (s *Server) availableName(ctx context.Context, spaceID uuid.UUID, parentID 
 	base := strings.TrimSuffix(wanted, ext)
 	for i := 1; i < 10000; i++ {
 		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
-		if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND lower(name)=lower($3) AND deleted_at IS NULL)`, spaceID, parentID, candidate).Scan(&exists); err != nil {
+		if err := s.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE space_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND section=$3 AND lower(name)=lower($4) AND deleted_at IS NULL)`, spaceID, parentID, section, candidate).Scan(&exists); err != nil {
 			return "", err
 		}
 		if !exists {

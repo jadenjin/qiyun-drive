@@ -116,9 +116,9 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		t.Fatalf("seed photo assets: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,inherit_permissions,created_by) VALUES
-		($1,$2,NULL,$3,'file','stage5-visible.png',true,$4),
-		($5,$2,$6,$7,'file','stage5-restricted.png',true,$4)`,
+		INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,section,inherit_permissions,created_by) VALUES
+		($1,$2,NULL,$3,'file','stage5-visible.png','photos',true,$4),
+		($5,$2,$6,$7,'file','stage5-restricted.png','photos',true,$4)`,
 		accessiblePhotoID, familySpaceID, accessibleAssetID, memberID,
 		restrictedPhotoID, childID, restrictedAssetID); err != nil {
 		t.Fatalf("seed photo nodes: %v", err)

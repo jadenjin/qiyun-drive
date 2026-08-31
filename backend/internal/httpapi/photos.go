@@ -23,7 +23,7 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(), `
 		SELECT n.id,n.name,a.id,a.object_key,a.mime_type,a.size_bytes,p.taken_at,p.width,p.height,p.camera,p.remark,p.thumb_small_key,p.thumb_large_key,n.created_at
 		FROM nodes n JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id
-		WHERE n.space_id=$1 AND n.deleted_at IS NULL AND a.status='ready' AND lower(split_part(a.mime_type,';',1)) IN ('image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif')
+		WHERE n.space_id=$1 AND n.section='photos' AND n.deleted_at IS NULL AND a.status='ready' AND lower(split_part(a.mime_type,';',1)) IN ('image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif')
 		ORDER BY COALESCE(p.taken_at,n.created_at) DESC,n.id DESC LIMIT 500`, spaceID)
 	if err != nil {
 		internalError(w, err)
@@ -108,7 +108,7 @@ func (s *Server) updatePhoto(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "remark_too_long", "备注最多 2000 个字符")
 		return
 	}
-	result, err := s.db.Exec(r.Context(), `UPDATE photo_details p SET remark=$1 FROM nodes n WHERE n.asset_id=p.asset_id AND n.id=$2`, input.Remark, nodeID)
+	result, err := s.db.Exec(r.Context(), `UPDATE photo_details p SET remark=$1 FROM nodes n WHERE n.asset_id=p.asset_id AND n.id=$2 AND n.section='photos'`, input.Remark, nodeID)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -329,7 +329,7 @@ func (s *Server) addAlbumItems(w http.ResponseWriter, r *http.Request) {
 		if err != nil || permission < permissionViewer {
 			continue
 		}
-		result, err := s.db.Exec(r.Context(), `INSERT INTO album_items(album_id,node_id,created_by) SELECT $1,n.id,$2 FROM nodes n JOIN assets a ON a.id=n.asset_id WHERE n.id=$3 AND n.space_id=$4 AND n.deleted_at IS NULL AND a.status='ready' AND a.mime_type LIKE 'image/%' ON CONFLICT DO NOTHING`, albumID, a.UserID, nodeID, albumSpace)
+		result, err := s.db.Exec(r.Context(), `INSERT INTO album_items(album_id,node_id,created_by) SELECT $1,n.id,$2 FROM nodes n JOIN assets a ON a.id=n.asset_id WHERE n.id=$3 AND n.space_id=$4 AND n.section='photos' AND n.deleted_at IS NULL AND a.status='ready' AND a.mime_type LIKE 'image/%' ON CONFLICT DO NOTHING`, albumID, a.UserID, nodeID, albumSpace)
 		if err == nil {
 			added += int(result.RowsAffected())
 		}

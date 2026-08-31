@@ -24,3 +24,16 @@ func TestQueryIndexMigrationIsEmbedded(t *testing.T) {
 		}
 	}
 }
+
+func TestPhotoLibrarySeparationMigrationIsEmbedded(t *testing.T) {
+	body, err := migrations.ReadFile("migrations/003_separate_photo_library.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, marker := range []string{"ADD COLUMN section", "section='photos'", "nodes_active_name_idx", "nodes_photo_timeline_idx"} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("missing photo separation marker %s", marker)
+		}
+	}
+}

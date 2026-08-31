@@ -56,3 +56,15 @@ func TestInferHEICMimeWhenBrowserDoesNotProvideOne(t *testing.T) {
 		t.Fatalf("unexpected mime type: %s", got)
 	}
 }
+
+func TestPhotoIndexingRequiresPhotoSection(t *testing.T) {
+	if !shouldIndexPhoto("photos", "image/jpeg") {
+		t.Fatal("photo-section image should be indexed")
+	}
+	if shouldIndexPhoto("files", "image/jpeg") {
+		t.Fatal("file-section image must not enter the photo timeline")
+	}
+	if shouldIndexPhoto("photos", "application/pdf") {
+		t.Fatal("non-image upload must not enter the photo timeline")
+	}
+}

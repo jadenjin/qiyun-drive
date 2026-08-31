@@ -59,7 +59,7 @@ func Load() (Config, error) {
 		S3Endpoint:       strings.TrimRight(env("S3_ENDPOINT", "http://localhost:9000"), "/"),
 		S3PublicEndpoint: strings.TrimRight(env("S3_PUBLIC_ENDPOINT", "http://localhost:9000"), "/"),
 		S3Region:         env("S3_REGION", "us-east-1"),
-		S3AccessKey:      env("S3_ACCESS_KEY", "panminio"),
+		S3AccessKey:      env("S3_ACCESS_KEY", "qiyun"),
 		S3SecretKey:      env("S3_SECRET_KEY", "change-me-now"),
 		S3Bucket:         env("S3_BUCKET", "pan-objects"),
 		PresignTTL:       presignTTL,
@@ -96,8 +96,8 @@ func (c Config) Validate() error {
 	if publicURL.Scheme == "http" && c.CookieSecure {
 		return fmt.Errorf("COOKIE_SECURE must be false when PUBLIC_BASE_URL uses HTTP")
 	}
-	if publicURL.Scheme == "http" && !isLoopbackHost(publicURL.Hostname()) {
-		return fmt.Errorf("PUBLIC_BASE_URL must use HTTPS outside localhost")
+	if publicURL.Scheme == "http" && !isPrivateOrLoopbackHost(publicURL.Hostname()) {
+		return fmt.Errorf("PUBLIC_BASE_URL must use HTTPS outside localhost or a private network")
 	}
 	if _, err := validateHTTPURL("S3_ENDPOINT", c.S3Endpoint); err != nil {
 		return err
@@ -127,12 +127,12 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func isLoopbackHost(host string) bool {
+func isPrivateOrLoopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
 
 func validateHTTPURL(name, value string) (*url.URL, error) {

@@ -72,6 +72,9 @@ test("drive UI uses real trash/share data and exposes folder and album uploads",
   assert.match(uploader, /return session\.nodeId/);
   assert.match(uploader, /albumId\?: string/);
   assert.match(uploader, /albumId: options\.albumId/);
+  assert.match(uploader, /section: options\.section \|\| "files"/);
+  assert.match(drive, /section === "photos" \? null : currentParent/);
+  assert.match(drive, /view === "photos"[\s\S]{0,300}aria-label="上传照片"/);
   assert.match(drive, /resumable\.albumId/);
 });
 
@@ -124,6 +127,8 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(permissions, /func \(s \*Server\) nodePermissions/);
   assert.match(permissions, /func \(s \*Server\) albumPermissions/);
   assert.match(nodes, /s\.nodePermissions\(r\.Context\(\), a, spaceID, ids\)/);
+  assert.match(nodes, /n\.section='files'/);
+  assert.match(photos, /n\.section='photos'/);
   assert.match(photos, /s\.albumPermissions\(r\.Context\(\), a, spaceID, ids\)/);
   assert.match(publicFlows, /loading="lazy" decoding="async"/);
   assert.match(styles, /\.heading-actions \.folder-upload-button \{ display: inline-flex; \}/);
@@ -136,25 +141,27 @@ test("drive UI exposes complete album, file-management, permission, and account 
 });
 
 test("release artifacts enforce health, isolation, recovery, and CI checks", async () => {
-  const [compose, production, backendDockerfile, minioDockerfile, operations, backup, workflow, config, packageJson] = await Promise.all([
+  const [compose, device, production, backendDockerfile, operations, backup, workflow, config, packageJson] = await Promise.all([
     readFile(new URL("compose.yaml", root), "utf8"),
+    readFile(new URL("compose.device.yaml", root), "utf8"),
     readFile(new URL("compose.production.yaml", root), "utf8"),
     readFile(new URL("backend/Dockerfile", root), "utf8"),
-    readFile(new URL("deploy/Minio.Dockerfile", root), "utf8"),
     readFile(new URL("docs/operations.md", root), "utf8"),
     readFile(new URL("scripts/backup.ps1", root), "utf8"),
     readFile(new URL(".github/workflows/ci.yml", root), "utf8"),
     readFile(new URL("backend/internal/config/config.go", root), "utf8"),
     readFile(new URL("package.json", root), "utf8"),
   ]);
-  assert.match(compose, /minio-ready:[\s\S]*service_completed_successfully/);
+  assert.match(compose, /rustfs:[\s\S]*service_healthy/);
   assert.match(compose, /POSTGRES_BIND_ADDRESS:-127\.0\.0\.1/);
-  assert.match(compose, /MINIO_BIND_ADDRESS:-127\.0\.0\.1/);
+  assert.match(compose, /RUSTFS_BIND_ADDRESS:-127\.0\.0\.1/);
+  assert.match(compose, /x-logging: &default_logging[\s\S]*max-size: 10m/);
   assert.match(compose, /worker:[\s\S]*api:[\s\S]*service_healthy/);
-  assert.match(production, /deploy\/Minio\.Dockerfile/);
-  assert.match(production, /RELEASE\.2025-10-15T17-29-55Z/);
+  assert.match(device, /ports: !override[\s\S]*9100:9000/);
+  assert.match(device, /volumes: !override[\s\S]*\/srv\/qiyun-drive-rustfs/);
+  assert.match(production, /rustfs\/rustfs/);
+  assert.match(production, /1\.0\.0-rc\.2/);
   assert.match(backendDockerfile, /USER pan/);
-  assert.match(minioDockerfile, /git clone[\s\S]*minio\/minio\.git/);
   assert.match(operations, /health\/ready/);
   assert.match(operations, /backup\.ps1/);
   assert.match(backup, /pg_dump/);
@@ -162,6 +169,6 @@ test("release artifacts enforce health, isolation, recovery, and CI checks", asy
   assert.match(backup, /runningServices[\s\S]*servicesToResume/);
   assert.match(workflow, /PAN_LIVE_INTEGRATION:[\s\S]*TestLiveAccountAndAuthorizationBoundaries/);
   assert.match(workflow, /docker compose config --quiet/);
-  assert.match(config, /PUBLIC_BASE_URL must use HTTPS outside localhost/);
+  assert.match(config, /PUBLIC_BASE_URL must use HTTPS outside localhost or a private network/);
   assert.equal(JSON.parse(packageJson).scripts.check, "npm run lint && npm test");
 });

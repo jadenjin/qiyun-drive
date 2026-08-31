@@ -55,7 +55,7 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, type UploadTask } from "./upload-client";
+import { api, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, type UploadSection, type UploadTask } from "./upload-client";
 
 type View = "files" | "photos" | "albums" | "shares" | "trash" | "family";
 type Space = { id: string; kind: "personal" | "family"; name: string; quotaBytes: number; usedBytes: number; reservedBytes: number; permission: string };
@@ -68,6 +68,19 @@ type CurrentUser = { id: string; username: string; displayName: string; role: st
 type ShareItem = { id: string; resourceType: string; resourceId: string; resourceName: string; hasPassword: boolean; allowDownload: boolean; expiresAt?: string; revokedAt?: string; createdAt: string; creatorName?: string; own?: boolean };
 type SessionItem = { id: string; current: boolean; createdAt: string; lastSeenAt: string; expiresAt: string };
 type CreatedActionLink = { title: string; description: string; url: string };
+
+function clientUUID() {
+  const secureCrypto = globalThis.crypto;
+  if (typeof secureCrypto?.randomUUID === "function") return secureCrypto.randomUUID();
+  if (typeof secureCrypto?.getRandomValues !== "function") {
+    return `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  }
+  const bytes = secureCrypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+}
 type FolderOption = { id: string; parentId?: string; name: string; permission: string; updatedAt: string };
 type PermissionEntry = { userId: string; username?: string; displayName?: string; permission: "none" | "viewer" | "editor" | "manager" };
 type PermissionEditorState = { resourceType: "node" | "album"; id: string; name: string; inherit: boolean; entries: PermissionEntry[] };
@@ -191,6 +204,7 @@ export function CloudDrive() {
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
+  const photoInput = useRef<HTMLInputElement>(null);
   const albumInput = useRef<HTMLInputElement>(null);
   const searchInput = useRef<HTMLInputElement>(null);
   const albumUploadTarget = useRef<Album | null>(null);
@@ -517,8 +531,8 @@ export function CloudDrive() {
   const createNamedItem = async (name: string) => {
     if (!name.trim()) return;
     if (status === "preview") {
-      if (dialog === "folder") setNodes((items) => [{ id: crypto.randomUUID(), spaceId, kind: "folder", name, sizeBytes: 0, mimeType: "", status: "ready", permission: "manager", updatedAt: new Date().toISOString() }, ...items]);
-      if (dialog === "album") setAlbums((items) => [{ id: crypto.randomUUID(), name, description: "刚刚创建的相册", itemCount: 0, createdAt: new Date().toISOString() }, ...items]);
+      if (dialog === "folder") setNodes((items) => [{ id: clientUUID(), spaceId, kind: "folder", name, sizeBytes: 0, mimeType: "", status: "ready", permission: "manager", updatedAt: new Date().toISOString() }, ...items]);
+      if (dialog === "album") setAlbums((items) => [{ id: clientUUID(), name, description: "刚刚创建的相册", itemCount: 0, createdAt: new Date().toISOString() }, ...items]);
       showToast(dialog === "folder" ? "文件夹已创建" : "相册已创建");
     } else {
       try {
@@ -531,16 +545,18 @@ export function CloudDrive() {
     setDialog(null);
   };
 
-  const handleFiles = async (selected: File[], albumId?: string) => {
+  const handleFiles = async (selected: File[], albumId?: string, section: UploadSection = "files") => {
     if (!selected.length) return;
     if (status === "preview") {
-      setUploads(selected.map((file) => ({ id: crypto.randomUUID(), name: file.name, relativePath: file.webkitRelativePath || file.name, size: file.size, progress: 1, state: "ready" })));
-      showToast(`已加入 ${selected.length} 个文件（界面预览）`);
+      setUploads(selected.map((file) => ({ id: clientUUID(), name: file.name, relativePath: file.webkitRelativePath || file.name, size: file.size, progress: 1, state: "ready" })));
+      showToast(`已加入 ${selected.length} 个${section === "photos" ? "照片" : "文件"}（界面预览）`);
       return;
     }
     let batchId: string | undefined;
-    try { batchId = await createFolderBatch(spaceId, currentParent, selected); } catch (error) { showToast(error instanceof Error ? error.message : "无法创建上传任务"); return; }
-    const tasks = selected.map((file) => ({ id: crypto.randomUUID(), name: file.name, relativePath: file.webkitRelativePath || file.name, size: file.size, progress: 0, state: "queued" as const }));
+    if (section === "files") {
+      try { batchId = await createFolderBatch(spaceId, currentParent, selected); } catch (error) { showToast(error instanceof Error ? error.message : "无法创建上传任务"); return; }
+    }
+    const tasks = selected.map((file) => ({ id: clientUUID(), name: file.name, relativePath: file.webkitRelativePath || file.name, size: file.size, progress: 0, state: "queued" as const }));
     setUploads((current) => [...tasks, ...current]);
     const queue = [...selected.entries()];
     const uploadedNodeIds: string[] = [];
@@ -554,7 +570,7 @@ export function CloudDrive() {
         uploadControllers.current.set(task.id, controller);
         setUploads((items) => items.map((item) => item.id === task.id ? { ...item, state: "uploading" } : item));
         try {
-          const nodeId = await uploadFile(file, { spaceId, parentId: currentParent, batchId, albumId, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
+          const nodeId = await uploadFile(file, { spaceId, parentId: section === "photos" ? null : currentParent, batchId, albumId, section, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
           uploadedNodeIds.push(nodeId);
           setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress: 1, state: "ready" } : item));
         } catch (error) {
@@ -579,17 +595,22 @@ export function CloudDrive() {
     albumInput.current?.click();
   };
 
-  const handleAlbumPhotos = async (selected: File[]) => {
-    const album = albumUploadTarget.current;
-    albumUploadTarget.current = null;
-    if (!album || !selected.length) return;
+  const handlePhotos = async (selected: File[], albumId?: string) => {
+    if (!selected.length) return;
     const images = selected.filter((file) => file.type.startsWith("image/") || /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(file.name));
     if (!images.length) {
       showToast("请选择照片文件");
       return;
     }
     if (images.length !== selected.length) showToast(`已忽略 ${selected.length - images.length} 个非照片文件`);
-    await handleFiles(images, album.id);
+    await handleFiles(images, albumId, "photos");
+  };
+
+  const handleAlbumPhotos = async (selected: File[]) => {
+    const album = albumUploadTarget.current;
+    albumUploadTarget.current = null;
+    if (!album || !selected.length) return;
+    await handlePhotos(selected, album.id);
   };
 
   const openAlbum = async (album: Album) => {
@@ -925,10 +946,11 @@ export function CloudDrive() {
       <main className="main-panel">
         <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu size={21} /></button><div className="search-box"><Search size={18} /><input ref={searchInput} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索当前页面" aria-label="搜索" /><kbd>Ctrl K</kbd></div><div className="notification-wrap"><button className="icon-button" onClick={() => setNotificationsOpen((value) => !value)} aria-label="通知"><Bell size={19} />{uploads.some((item) => item.state === "failed" || item.state === "uploading") && <span className="notification-dot" />}</button>{notificationsOpen && <div className="notification-menu"><strong>最近上传</strong>{uploads.length ? uploads.slice(0, 5).map((item) => <span key={item.id}><File size={14} /><span>{item.name}<small>{item.state === "ready" ? "上传完成" : item.state === "failed" ? item.error || "上传失败" : item.state === "paused" ? "已暂停" : "上传中"}</small></span></span>) : <p>暂无通知</p>}</div>}</div><button className="avatar-button" onClick={() => { setMenuOpen(true); setAccountOpen(true); }} aria-label="账户菜单">{userInitial}</button></header>
         <div className="content">
-          {status === "preview" && <div className="preview-banner"><Sparkles size={16} /><span>当前是界面预览。启动整套服务后，文件与照片会安全存入你的 MinIO。</span><button onClick={() => setStatus("setup")}>体验初始化</button></div>}
-          <div className="page-heading"><div><p>{viewMeta[view].kicker}</p><h1>{viewMeta[view].title}</h1></div><div className="heading-actions">{view === "files" && <><button className="secondary-button" onClick={() => setDialog("folder")} aria-label="新建文件夹"><Plus size={17} /> 新建文件夹</button><button className="secondary-button folder-upload-button" onClick={() => folderInput.current?.click()} aria-label="上传文件夹"><UploadCloud size={17} /> 上传文件夹</button><button className="primary-button" onClick={() => fileInput.current?.click()} aria-label="上传文件"><UploadCloud size={18} /> 上传文件</button></>}{view === "albums" && <button className="primary-button" onClick={() => setDialog("album")}><Plus size={18} /> 新建相册</button>}{view === "family" && <button className="primary-button" onClick={() => setDialog("invite")}><UserPlus size={18} /> 邀请成员</button>}</div></div>
+          {status === "preview" && <div className="preview-banner"><Sparkles size={16} /><span>当前是界面预览。启动整套服务后，文件与照片会安全存入你的 RustFS。</span><button onClick={() => setStatus("setup")}>体验初始化</button></div>}
+          <div className="page-heading"><div><p>{viewMeta[view].kicker}</p><h1>{viewMeta[view].title}</h1></div><div className="heading-actions">{view === "files" && <><button className="secondary-button" onClick={() => setDialog("folder")} aria-label="新建文件夹"><Plus size={17} /> 新建文件夹</button><button className="secondary-button folder-upload-button" onClick={() => folderInput.current?.click()} aria-label="上传文件夹"><UploadCloud size={17} /> 上传文件夹</button><button className="primary-button" onClick={() => fileInput.current?.click()} aria-label="上传文件"><UploadCloud size={18} /> 上传文件</button></>}{view === "photos" && <button className="primary-button" onClick={() => photoInput.current?.click()} aria-label="上传照片"><UploadCloud size={18} /> 上传照片</button>}{view === "albums" && <button className="primary-button" onClick={() => setDialog("album")}><Plus size={18} /> 新建相册</button>}{view === "family" && <button className="primary-button" onClick={() => setDialog("invite")}><UserPlus size={18} /> 邀请成员</button>}</div></div>
           <input ref={fileInput} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={(node) => { folderInput.current = node; if (node) node.setAttribute("webkitdirectory", ""); }} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
+          <input ref={photoInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handlePhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={albumInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handleAlbumPhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           {view === "files" && <FileView items={filteredNodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={(item) => void openNode(item)} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
           {view === "photos" && <PhotoView photos={filteredPhotos} onOpen={(photo) => setPhotoViewer({ photo })} />}
@@ -997,7 +1019,7 @@ function PhotoView({ photos, onOpen }: { photos: PhotoItem[]; onOpen: (photo: Ph
     });
     return Array.from(result.entries());
   }, [photos]);
-  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自所有相册与文件目录，按拍摄时间自动整理</small></span><span className="timeline-label"><Clock3 size={17} /> 时间线</span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="在相册中上传照片后，这里会按拍摄日期自动生成时间线" />}</div>;
+  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自照片页与相册，按拍摄时间自动整理</small></span><span className="timeline-label"><Clock3 size={17} /> 时间线</span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="从照片页或相册上传后，这里会按拍摄日期自动生成时间线" />}</div>;
 }
 
 function AlbumView({ albums, onOpen, onUpload, onShare }: { albums: Album[]; onOpen: (album: Album) => void; onUpload: (album: Album) => void; onShare: (album: Album) => void }) {
@@ -1203,5 +1225,5 @@ function SetupScreen({ values, onChange, onSubmit, toast }: { values: { househol
 }
 
 function AuthShell({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
-  return <main className="auth-shell"><section className="auth-story"><div className="auth-brand"><span><Cloud size={22} /></span>栖云</div><div className="story-copy"><span className="eyebrow">YOUR PRIVATE CLOUD</span><h1>把记忆与重要文件，<br />留在真正属于你的地方。</h1><p>文件、照片与家人的共同回忆，安静地存放在自己的服务器里。</p></div><div className="story-cards"><div className="story-card card-file"><Folder size={22} /><span><strong>家庭影像</strong><small>428 个项目</small></span></div><div className="story-card card-photo"><Camera size={22} /><span><strong>夏日旅行</strong><small>刚刚完成备份</small></span></div></div><small className="auth-privacy">MinIO 私有存储 · 严格权限隔离</small></section><section className="auth-panel"><div className="auth-box"><span className="mobile-auth-brand"><Cloud size={22} /> 栖云</span><h2>{title}</h2><p>{subtitle}</p>{children}</div></section></main>;
+  return <main className="auth-shell"><section className="auth-story"><div className="auth-brand"><span><Cloud size={22} /></span>栖云</div><div className="story-copy"><span className="eyebrow">YOUR PRIVATE CLOUD</span><h1>把记忆与重要文件，<br />留在真正属于你的地方。</h1><p>文件、照片与家人的共同回忆，安静地存放在自己的服务器里。</p></div><div className="story-cards"><div className="story-card card-file"><Folder size={22} /><span><strong>家庭影像</strong><small>428 个项目</small></span></div><div className="story-card card-photo"><Camera size={22} /><span><strong>夏日旅行</strong><small>刚刚完成备份</small></span></div></div><small className="auth-privacy">RustFS 私有存储 · 严格权限隔离</small></section><section className="auth-panel"><div className="auth-box"><span className="mobile-auth-brand"><Cloud size={22} /> 栖云</span><h2>{title}</h2><p>{subtitle}</p>{children}</div></section></main>;
 }
