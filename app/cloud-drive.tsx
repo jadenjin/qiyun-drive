@@ -11,7 +11,6 @@ import {
   Camera,
   ChevronDown,
   ChevronRight,
-  Clock3,
   Cloud,
   Copy,
   Download,
@@ -1019,7 +1018,7 @@ function PhotoView({ photos, onOpen }: { photos: PhotoItem[]; onOpen: (photo: Ph
     });
     return Array.from(result.entries());
   }, [photos]);
-  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自照片页与相册，按拍摄时间自动整理</small></span><span className="timeline-label"><Clock3 size={17} /> 时间线</span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="从照片页或相册上传后，这里会按拍摄日期自动生成时间线" />}</div>;
+  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自照片页与相册，按拍摄时间自动整理</small></span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="从照片页或相册上传后，这里会按拍摄日期自动生成时间线" />}</div>;
 }
 
 function AlbumView({ albums, onOpen, onUpload, onShare }: { albums: Album[]; onOpen: (album: Album) => void; onUpload: (album: Album) => void; onShare: (album: Album) => void }) {
