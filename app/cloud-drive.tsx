@@ -38,7 +38,6 @@ import {
   Pause,
   Play,
   Plus,
-  Search,
   Save,
   Settings,
   Share2,
@@ -193,7 +192,6 @@ export function CloudDrive() {
   const [currentParent, setCurrentParent] = useState<string | null>(null);
   const [breadcrumbs, setBreadcrumbs] = useState<{ id: string | null; name: string }[]>([{ id: null, name: "我的空间" }]);
   const [grid, setGrid] = useState(false);
-  const [search, setSearch] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [spaceOpen, setSpaceOpen] = useState(false);
   const [dialog, setDialog] = useState<null | "folder" | "album" | "invite">(null);
@@ -205,7 +203,6 @@ export function CloudDrive() {
   const folderInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   const albumInput = useRef<HTMLInputElement>(null);
-  const searchInput = useRef<HTMLInputElement>(null);
   const albumUploadTarget = useRef<Album | null>(null);
   const resumeAttempted = useRef(false);
   const uploadControllers = useRef(new Map<string, AbortController>());
@@ -364,17 +361,6 @@ export function CloudDrive() {
       if (previousFocus?.isConnected) previousFocus.focus();
     };
   }, [activeModal]);
-
-  useEffect(() => {
-    const focusSearch = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        searchInput.current?.focus();
-      }
-    };
-    window.addEventListener("keydown", focusSearch);
-    return () => window.removeEventListener("keydown", focusSearch);
-  }, []);
 
   useEffect(() => {
     if (status !== "ready" || resumeAttempted.current) return;
@@ -919,9 +905,6 @@ export function CloudDrive() {
   if (status === "setup") return <SetupScreen values={setupForm} onChange={setSetupForm} onSubmit={submitSetup} toast={toast} />;
   if (status === "login") return <LoginScreen values={loginForm} onChange={setLoginForm} onSubmit={submitLogin} toast={toast} />;
 
-  const filteredNodes = nodes.filter((item) => item.name.toLowerCase().includes(search.toLowerCase()));
-  const filteredPhotos = photos.filter((item) => `${item.name} ${item.remark}`.toLowerCase().includes(search.toLowerCase()));
-  const filteredAlbums = albums.filter((item) => `${item.name} ${item.description}`.toLowerCase().includes(search.toLowerCase()));
   const activeShareCount = shares.filter((share) => !share.revokedAt && (!share.expiresAt || new Date(share.expiresAt).getTime() > Date.now())).length;
   const userInitial = currentUser?.displayName.trim().slice(0, 1) || "云";
   const roleLabel = currentUser?.role === "owner" ? "家庭所有者" : currentUser?.role === "admin" ? "家庭管理员" : "家庭成员";
@@ -939,11 +922,14 @@ export function CloudDrive() {
         <div className="nav-section-label">家庭</div>
         <nav className="side-nav"><button className={view === "family" ? "active" : ""} onClick={() => changeView("family")}><Users size={19} /><span>成员与权限</span></button></nav>
         <div className="storage-card"><div className="storage-head"><span><HardDrive size={16} /> 存储空间</span><strong>{Math.round(usedPercent)}%</strong></div><div className="storage-track"><span style={{ width: `${usedPercent}%` }} /></div><p>已用 {formatBytes(selectedSpace?.usedBytes || 0)}<br />共 {selectedSpace?.quotaBytes ? formatBytes(selectedSpace.quotaBytes) : "不限额"}</p></div>
-        <div className="profile-wrap"><button className="profile-row" onClick={() => setAccountOpen((value) => !value)}><span className="profile-avatar">{userInitial}</span><span><strong>{currentUser?.displayName || "访客"}</strong><small>{status === "preview" ? "界面预览" : roleLabel}</small></span><Settings size={17} /></button>{accountOpen && <div className="account-menu"><div><strong>{currentUser?.displayName}</strong><small>@{currentUser?.username}</small></div><button onClick={() => void openAccountSettings()}><UserRound size={15} /> 账户设置</button><button onClick={logout}><LogOut size={15} /> 退出登录</button></div>}</div>
+        <div className="sidebar-footer">
+          <div className="notification-wrap sidebar-notification"><button className="sidebar-notification-button" onClick={() => { setNotificationsOpen((value) => !value); setAccountOpen(false); }} aria-label="通知"><Bell size={17} /><span>最近上传</span>{uploads.some((item) => item.state === "failed" || item.state === "uploading") && <span className="notification-dot" />}</button>{notificationsOpen && <div className="notification-menu"><strong>最近上传</strong>{uploads.length ? uploads.slice(0, 5).map((item) => <span key={item.id}><File size={14} /><span>{item.name}<small>{item.state === "ready" ? "上传完成" : item.state === "failed" ? item.error || "上传失败" : item.state === "paused" ? "已暂停" : "上传中"}</small></span></span>) : <p>暂无通知</p>}</div>}</div>
+          <div className="profile-wrap"><button className="profile-row" onClick={() => { setAccountOpen((value) => !value); setNotificationsOpen(false); }}><span className="profile-avatar">{userInitial}</span><span><strong>{currentUser?.displayName || "访客"}</strong><small>{status === "preview" ? "界面预览" : roleLabel}</small></span><Settings size={17} /></button>{accountOpen && <div className="account-menu"><div><strong>{currentUser?.displayName}</strong><small>@{currentUser?.username}</small></div><button onClick={() => void openAccountSettings()}><UserRound size={15} /> 账户设置</button><button onClick={logout}><LogOut size={15} /> 退出登录</button></div>}</div>
+        </div>
       </aside>
 
       <main className="main-panel">
-        <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu size={21} /></button><div className="search-box"><Search size={18} /><input ref={searchInput} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索当前页面" aria-label="搜索" /><kbd>Ctrl K</kbd></div><div className="notification-wrap"><button className="icon-button" onClick={() => setNotificationsOpen((value) => !value)} aria-label="通知"><Bell size={19} />{uploads.some((item) => item.state === "failed" || item.state === "uploading") && <span className="notification-dot" />}</button>{notificationsOpen && <div className="notification-menu"><strong>最近上传</strong>{uploads.length ? uploads.slice(0, 5).map((item) => <span key={item.id}><File size={14} /><span>{item.name}<small>{item.state === "ready" ? "上传完成" : item.state === "failed" ? item.error || "上传失败" : item.state === "paused" ? "已暂停" : "上传中"}</small></span></span>) : <p>暂无通知</p>}</div>}</div><button className="avatar-button" onClick={() => { setMenuOpen(true); setAccountOpen(true); }} aria-label="账户菜单">{userInitial}</button></header>
+        <header className="topbar"><button className="menu-button" onClick={() => setMenuOpen(true)} aria-label="打开菜单"><Menu size={21} /></button></header>
         <div className="content">
           {status === "preview" && <div className="preview-banner"><Sparkles size={16} /><span>当前是界面预览。启动整套服务后，文件与照片会安全存入你的 RustFS。</span><button onClick={() => setStatus("setup")}>体验初始化</button></div>}
           <div className="page-heading"><div><p>{viewMeta[view].kicker}</p><h1>{viewMeta[view].title}</h1></div><div className="heading-actions">{view === "files" && <><button className="secondary-button" onClick={() => setDialog("folder")} aria-label="新建文件夹"><Plus size={17} /> 新建文件夹</button><button className="secondary-button folder-upload-button" onClick={() => folderInput.current?.click()} aria-label="上传文件夹"><UploadCloud size={17} /> 上传文件夹</button><button className="primary-button" onClick={() => fileInput.current?.click()} aria-label="上传文件"><UploadCloud size={18} /> 上传文件</button></>}{view === "photos" && <button className="primary-button" onClick={() => photoInput.current?.click()} aria-label="上传照片"><UploadCloud size={18} /> 上传照片</button>}{view === "albums" && <button className="primary-button" onClick={() => setDialog("album")}><Plus size={18} /> 新建相册</button>}{view === "family" && <button className="primary-button" onClick={() => setDialog("invite")}><UserPlus size={18} /> 邀请成员</button>}</div></div>
@@ -951,9 +937,9 @@ export function CloudDrive() {
           <input ref={(node) => { folderInput.current = node; if (node) node.setAttribute("webkitdirectory", ""); }} type="file" multiple hidden onChange={(event) => { void handleFiles(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={photoInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handlePhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={albumInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handleAlbumPhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
-          {view === "files" && <FileView items={filteredNodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={(item) => void openNode(item)} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
-          {view === "photos" && <PhotoView photos={filteredPhotos} onOpen={(photo) => setPhotoViewer({ photo })} />}
-          {view === "albums" && (selectedAlbum ? <AlbumDetail album={selectedAlbum} photos={albumPhotos.filter((item) => `${item.name} ${item.remark}`.toLowerCase().includes(search.toLowerCase()))} onBack={() => { setSelectedAlbum(null); setAlbumPhotos([]); }} onUpload={chooseAlbumPhotos} onOpen={(photo) => setPhotoViewer({ photo, albumId: selectedAlbum.id })} onEdit={setAlbumEditor} onPermissions={selectedSpace?.kind === "family" && selectedAlbum.permission === "manager" ? (album) => void openPermissionEditor("album", album.id, album.name) : undefined} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} onDelete={deleteAlbum} /> : <AlbumView albums={filteredAlbums} onOpen={openAlbum} onUpload={chooseAlbumPhotos} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} />)}
+          {view === "files" && <FileView items={nodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={(item) => void openNode(item)} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
+          {view === "photos" && <PhotoView photos={photos} onOpen={(photo) => setPhotoViewer({ photo })} />}
+          {view === "albums" && (selectedAlbum ? <AlbumDetail album={selectedAlbum} photos={albumPhotos} onBack={() => { setSelectedAlbum(null); setAlbumPhotos([]); }} onUpload={chooseAlbumPhotos} onOpen={(photo) => setPhotoViewer({ photo, albumId: selectedAlbum.id })} onEdit={setAlbumEditor} onPermissions={selectedSpace?.kind === "family" && selectedAlbum.permission === "manager" ? (album) => void openPermissionEditor("album", album.id, album.name) : undefined} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} onDelete={deleteAlbum} /> : <AlbumView albums={albums} onOpen={openAlbum} onUpload={chooseAlbumPhotos} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} />)}
           {view === "shares" && <ShareView shares={status === "preview" ? undefined : shares} onRevoke={revokeShare} />}
           {view === "trash" && <TrashView nodes={status === "preview" ? previewNodes.slice(3, 5).map((item) => ({ ...item, deletedAt: new Date(Date.now() - 3 * 86400000).toISOString(), purgeAt: new Date(Date.now() + 27 * 86400000).toISOString() })) : trashNodes} onRestore={restoreTrashNode} onPurge={purgeTrashNode} onEmpty={emptyTrash} />}
           {view === "family" && <FamilyView members={members} auditItems={auditItems} space={spaces.find((item) => item.kind === "family") || selectedSpace} canManage={currentUser?.role === "owner" || currentUser?.role === "admin"} canEditRoles={currentUser?.role === "owner"} canEditQuota={currentUser?.role === "owner"} canResetMember={(member) => currentUser?.role === "owner" || member.role === "member"} onResetPassword={createMemberPasswordReset} onRoleChange={updateMemberRole} onPermissionGuide={() => setPermissionGuideOpen(true)} onEditQuota={(space) => setQuotaEditor(space)} />}
