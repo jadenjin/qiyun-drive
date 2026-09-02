@@ -92,6 +92,7 @@ test("drive UI exposes complete album, file-management, permission, and account 
     readFile(new URL("app/globals.css", root), "utf8"),
   ]);
   assert.match(drive, /function AlbumDetail/);
+  assert.match(drive, /className="album-card-open"[\s\S]{0,120}onClick=\{\(\) => onOpen\(album\)\}/);
   assert.match(drive, /function PhotoViewer/);
   assert.match(drive, /savePhotoRemark/);
   assert.match(drive, /function MoveDialog/);
@@ -132,6 +133,7 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(photos, /s\.albumPermissions\(r\.Context\(\), a, spaceID, ids\)/);
   assert.match(publicFlows, /loading="lazy" decoding="async"/);
   assert.match(styles, /\.heading-actions \.folder-upload-button \{ display: inline-flex; \}/);
+  assert.match(styles, /\.album-card-open \{ position: absolute; inset: 0; z-index: 1;/);
   assert.match(styles, /\.modal \{ max-height: calc\(100dvh - 20px\); overflow-y: auto; \}/);
   assert.match(worker, /DELETE FROM invitations WHERE \(accepted_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
   assert.match(worker, /DELETE FROM password_resets WHERE \(used_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
