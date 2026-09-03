@@ -76,6 +76,9 @@ test("drive UI uses real trash/share data and exposes folder and album uploads",
   assert.match(drive, /section === "photos" \? null : currentParent/);
   assert.match(drive, /view === "photos"[\s\S]{0,300}aria-label="上传照片"/);
   assert.match(drive, /resumable\.albumId/);
+  assert.match(uploader, /ownerUserId: string/);
+  assert.match(drive, /loadResumableUploads\(currentUser\.id\)/);
+  assert.match(drive, /await clearAllResumeState\(\)/);
 });
 
 test("drive UI exposes complete album, file-management, permission, and account flows", async () => {
@@ -102,6 +105,7 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(drive, /function AccountDialog/);
   assert.match(drive, /function ActionLinkDialog/);
   assert.match(drive, /function FilePreviewDialog/);
+  assert.match(drive, /sandbox="" referrerPolicy="no-referrer"/);
   assert.match(drive, /function ShareCreatedDialog/);
   assert.match(drive, /canInviteAdmin/);
   assert.match(drive, /登录设备/);
@@ -134,6 +138,10 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(photos, /n\.section='photos'/);
   assert.match(photos, /s\.albumPermissions\(r\.Context\(\), a, spaceID, ids\)/);
   assert.match(publicFlows, /loading="lazy" decoding="async"/);
+  assert.match(publicFlows, /form method="post" action=\{data\.archiveUrl\}/);
+  assert.match(publicFlows, /name="access_token" value=\{archiveAccessToken\}/);
+  assert.doesNotMatch(routes, /Get\("\/public\/shares\/\{token\}\/archive"/);
+  assert.match(routes, /Post\("\/public\/shares\/\{token\}\/archive", s\.publicShareArchive\)/);
   assert.match(styles, /\.heading-actions \.folder-upload-button \{ display: inline-flex; \}/);
   assert.match(styles, /\.album-card-open \{ position: absolute; inset: 0; z-index: 1;/);
   assert.match(styles, /\.sidebar-notification \.notification-menu \{ top: auto;/);
@@ -141,17 +149,36 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(styles, /\.modal \{ max-height: calc\(100dvh - 20px\); overflow-y: auto; \}/);
   assert.match(worker, /DELETE FROM invitations WHERE \(accepted_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
   assert.match(worker, /DELETE FROM password_resets WHERE \(used_at IS NOT NULL OR expires_at<now\(\)\).*30 days/);
+  assert.match(worker, /UPDATE nodes n SET purge_job_id=NULL WHERE n\.purge_job_id IS NOT NULL/);
   const deleteNode = worker.indexOf("DELETE FROM nodes WHERE id=$1");
   const deleteAsset = worker.indexOf("DELETE FROM assets WHERE id=$1", deleteNode);
   assert.ok(deleteNode >= 0 && deleteAsset > deleteNode, "purge must delete the node tree before its assets");
 });
 
 test("release artifacts enforce health, isolation, recovery, and CI checks", async () => {
-  const [compose, device, production, backendDockerfile, operations, backup, workflow, config, packageJson] = await Promise.all([
+  const [
+    compose,
+    device,
+    production,
+    webDockerfile,
+    backendDockerfile,
+    caddyDockerfile,
+    postgresDockerfile,
+    rustfsDockerfile,
+    operations,
+    backup,
+    workflow,
+    config,
+    packageJson,
+  ] = await Promise.all([
     readFile(new URL("compose.yaml", root), "utf8"),
     readFile(new URL("compose.device.yaml", root), "utf8"),
     readFile(new URL("compose.production.yaml", root), "utf8"),
+    readFile(new URL("Dockerfile", root), "utf8"),
     readFile(new URL("backend/Dockerfile", root), "utf8"),
+    readFile(new URL("deploy/Dockerfile.caddy", root), "utf8"),
+    readFile(new URL("deploy/Dockerfile.postgres", root), "utf8"),
+    readFile(new URL("deploy/Dockerfile.rustfs", root), "utf8"),
     readFile(new URL("docs/operations.md", root), "utf8"),
     readFile(new URL("scripts/backup.ps1", root), "utf8"),
     readFile(new URL(".github/workflows/ci.yml", root), "utf8"),
@@ -167,7 +194,36 @@ test("release artifacts enforce health, isolation, recovery, and CI checks", asy
   assert.match(device, /volumes: !override[\s\S]*\/srv\/qiyun-drive-rustfs/);
   assert.match(production, /rustfs\/rustfs/);
   assert.match(production, /1\.0\.0-rc\.2/);
+  assert.match(webDockerfile, /USER node/);
+  assert.match(webDockerfile, /apk upgrade --no-cache/);
+  assert.match(webDockerfile, /rm -rf \/usr\/local\/lib\/node_modules\/npm/);
   assert.match(backendDockerfile, /USER pan/);
+  assert.match(backendDockerfile, /golang:1\.26\.6-alpine/);
+  assert.match(backendDockerfile, /apk upgrade --no-cache/);
+  assert.match(caddyDockerfile, /golang:1\.26\.6-alpine/);
+  assert.match(caddyDockerfile, /CADDY_VERSION=v2\.11\.4/);
+  assert.match(caddyDockerfile, /CADDY_COMMIT=e2eee6a7fce366321294c9c2a79f3146891dcbdf/);
+  assert.match(caddyDockerfile, /CADDY_CEL_V2_COMMIT=b2693fb63a30e6d7be0972c3645e9a2c0a500e93/);
+  assert.match(caddyDockerfile, /github\.com\/google\/cel-go@v0\.30\.0/);
+  assert.match(caddyDockerfile, /github\.com\/klauspost\/compress@v1\.18\.7/);
+  assert.match(caddyDockerfile, /github\.com\/go-chi\/chi\/v5@v5\.3\.0/);
+  assert.match(caddyDockerfile, /golang\.org\/x\/crypto@v0\.56\.0/);
+  assert.match(caddyDockerfile, /USER caddy/);
+  assert.match(postgresDockerfile, /POSTGRES_IMAGE=postgres:17\.11-alpine/);
+  assert.match(postgresDockerfile, /rm -f \/usr\/local\/bin\/gosu/);
+  assert.match(postgresDockerfile, /USER postgres/);
+  assert.match(rustfsDockerfile, /apk upgrade --no-cache/);
+  assert.match(rustfsDockerfile, /USER rustfs/);
+  assert.match(compose, /caddy:[\s\S]*dockerfile: deploy\/Dockerfile\.caddy[\s\S]*read_only: true/);
+  assert.match(compose, /net\.ipv4\.ip_unprivileged_port_start: 0/);
+  assert.match(compose, /caddy_data_v2:\/data/);
+  assert.match(compose, /\/config:rw,noexec,nosuid,nodev,size=16777216,uid=10002,gid=10002/);
+  assert.match(compose, /web:[\s\S]*read_only: true[\s\S]*\/tmp:rw,noexec,nosuid,nodev,size=67108864,uid=1000,gid=1000/);
+  assert.match(compose, /postgres:[\s\S]*dockerfile: deploy\/Dockerfile\.postgres[\s\S]*read_only: true/);
+  assert.match(compose, /rustfs:[\s\S]*dockerfile: deploy\/Dockerfile\.rustfs[\s\S]*read_only: true/);
+  assert.match(compose, /security_opt:[\s\S]*no-new-privileges:true/);
+  assert.match(compose, /cap_drop:[\s\S]*- ALL/);
+  assert.match(compose, /worker:[\s\S]*read_only: true[\s\S]*tmpfs:[\s\S]*noexec,nosuid,nodev/);
   assert.match(operations, /health\/ready/);
   assert.match(operations, /backup\.ps1/);
   assert.match(backup, /pg_dump/);
@@ -175,6 +231,9 @@ test("release artifacts enforce health, isolation, recovery, and CI checks", asy
   assert.match(backup, /runningServices[\s\S]*servicesToResume/);
   assert.match(workflow, /PAN_LIVE_INTEGRATION:[\s\S]*TestLiveAccountAndAuthorizationBoundaries/);
   assert.match(workflow, /docker compose config --quiet/);
+  assert.match(workflow, /docker compose build caddy web api worker/);
   assert.match(config, /PUBLIC_BASE_URL must use HTTPS outside localhost or a private network/);
+  assert.match(config, /S3_PUBLIC_ENDPOINT must use HTTPS outside localhost or a private network/);
+  assert.match(compose, /TRUST_PROXY: "true"/);
   assert.equal(JSON.parse(packageJson).scripts.check, "npm run lint && npm test");
 });

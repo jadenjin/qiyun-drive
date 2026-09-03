@@ -185,6 +185,13 @@ func (s *Server) unlockShare(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "wrong_password", "访问密码错误")
 		return
 	}
+	if passwordHash == nil {
+		// The public URL is already the capability for an unprotected share.
+		// Reuse it rather than creating an unbounded access-token row on every
+		// page refresh.
+		writeJSON(w, http.StatusOK, map[string]any{"accessToken": token})
+		return
+	}
 	plain, hash, err := panAuth.NewToken(32)
 	if err != nil {
 		internalError(w, err)
@@ -204,7 +211,7 @@ func chiParam(r *http.Request, name string) string {
 
 func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 	plainToken := chiParam(r, "token")
-	shareID, resourceID, resourceType, allowDownload, access, _, err := s.validateShareAccess(r)
+	shareID, resourceID, resourceType, allowDownload, _, _, err := s.validateShareAccess(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "share_locked", "请先验证分享密码")
 		return
@@ -278,7 +285,7 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if allowDownload && resourceType != "file" {
-		response["archiveUrl"] = fmt.Sprintf("/api/v1/public/shares/%s/archive?access_token=%s", plainToken, access)
+		response["archiveUrl"] = fmt.Sprintf("/api/v1/public/shares/%s/archive", plainToken)
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -287,7 +294,7 @@ func (s *Server) validateShareAccess(r *http.Request) (uuid.UUID, uuid.UUID, str
 	plainToken := chiParam(r, "token")
 	access := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if access == "" {
-		access = r.URL.Query().Get("access_token")
+		access = r.PostForm.Get("access_token")
 	}
 	if !panAuth.ValidToken(plainToken, 32) || !panAuth.ValidToken(access, 32) {
 		return uuid.Nil, uuid.Nil, "", false, "", actor{}, fmt.Errorf("invalid share token")
@@ -297,8 +304,11 @@ func (s *Server) validateShareAccess(r *http.Request) (uuid.UUID, uuid.UUID, str
 	var allowDownload bool
 	err := s.db.QueryRow(r.Context(), `
 		SELECT s.id,s.resource_type,s.resource_id,s.allow_download,s.created_by
-		FROM public_shares s JOIN share_access_tokens a ON a.share_id=s.id
-		WHERE s.token_hash=$1 AND a.token_hash=$2 AND a.expires_at>now() AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>now())`, panAuth.TokenHash(plainToken), panAuth.TokenHash(access)).Scan(&shareID, &resourceType, &resourceID, &allowDownload, &creatorID)
+		FROM public_shares s
+		WHERE s.token_hash=$1 AND s.revoked_at IS NULL AND (s.expires_at IS NULL OR s.expires_at>now())
+		AND ((s.password_hash IS NULL AND s.token_hash=$2) OR EXISTS (
+			SELECT 1 FROM share_access_tokens a WHERE a.share_id=s.id AND a.token_hash=$2 AND a.expires_at>now()
+		))`, panAuth.TokenHash(plainToken), panAuth.TokenHash(access)).Scan(&shareID, &resourceType, &resourceID, &allowDownload, &creatorID)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, "", false, "", actor{}, err
 	}
@@ -332,6 +342,11 @@ func (s *Server) validateShareAccess(r *http.Request) (uuid.UUID, uuid.UUID, str
 }
 
 func (s *Server) publicShareArchive(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_form", "下载凭据格式不正确")
+		return
+	}
 	_, resourceID, resourceType, allowDownload, _, _, err := s.validateShareAccess(r)
 	if err != nil || !allowDownload || resourceType == "file" {
 		writeError(w, http.StatusNotFound, "not_found", "下载不可用")
@@ -394,11 +409,13 @@ func (s *Server) publicShareArchive(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		part, err := zw.Create(strings.ReplaceAll(entry.Name, "\\", "/"))
+		part, err := zw.Create(safeArchivePath(entry.Name))
 		if err == nil {
 			_, err = io.Copy(part, body)
 		}
-		body.Close()
+		if closeErr := body.Close(); err == nil {
+			err = closeErr
+		}
 		if err != nil {
 			return
 		}

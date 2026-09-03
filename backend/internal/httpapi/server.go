@@ -74,7 +74,7 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 		r.With(s.limitSensitive).Post("/password-resets/complete", s.completePasswordReset)
 		r.With(s.limitSensitive).Post("/public/shares/{token}/unlock", s.unlockShare)
 		r.Get("/public/shares/{token}", s.publicShare)
-		r.Get("/public/shares/{token}/archive", s.publicShareArchive)
+		r.Post("/public/shares/{token}/archive", s.publicShareArchive)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireAuth)
 			r.Get("/me", s.me)
@@ -206,8 +206,14 @@ func (l *attemptLimiter) cleanupLocked(now time.Time) {
 
 func (s *Server) clientIP(r *http.Request) string {
 	if s.cfg.TrustProxy {
-		if candidate := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); net.ParseIP(candidate) != nil {
-			return candidate
+		// This deployment trusts exactly one in-network reverse proxy. Read the
+		// rightmost valid hop so a client-supplied prefix cannot bypass rate
+		// limits if a proxy appends instead of replacing X-Forwarded-For.
+		forwarded := strings.Split(r.Header.Get("X-Forwarded-For"), ",")
+		for index := len(forwarded) - 1; index >= 0; index-- {
+			if candidate := strings.TrimSpace(forwarded[index]); net.ParseIP(candidate) != nil {
+				return candidate
+			}
 		}
 	}
 	client, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -246,6 +252,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "base-uri 'none'; frame-ancestors 'none'; object-src 'none'")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -303,7 +310,7 @@ func (s *Server) requestLog(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		slog.Info("request", "request_id", requestID, "method", r.Method, "path", r.URL.Path, "status", status, "bytes", recorder.bytes, "duration_ms", time.Since(started).Milliseconds())
+		slog.Info("request", "request_id", requestID, "method", r.Method, "path", safeLogPath(r.URL.Path), "status", status, "bytes", recorder.bytes, "duration_ms", time.Since(started).Milliseconds())
 	})
 }
 
@@ -361,16 +368,28 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
-		slog.Warn("invalid request json", "method", r.Method, "path", r.URL.Path, "error", err)
+		slog.Warn("invalid request json", "method", r.Method, "path", safeLogPath(r.URL.Path), "error", err)
 		writeError(w, http.StatusBadRequest, "invalid_json", "请求内容格式不正确")
 		return false
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
-		slog.Warn("invalid trailing json", "method", r.Method, "path", r.URL.Path, "error", err)
+		slog.Warn("invalid trailing json", "method", r.Method, "path", safeLogPath(r.URL.Path), "error", err)
 		writeError(w, http.StatusBadRequest, "invalid_json", "请求内容只能包含一个 JSON 对象")
 		return false
 	}
 	return true
+}
+
+func safeLogPath(raw string) string {
+	const sharePrefix = "/api/v1/public/shares/"
+	if !strings.HasPrefix(raw, sharePrefix) {
+		return raw
+	}
+	remainder := strings.TrimPrefix(raw, sharePrefix)
+	if slash := strings.IndexByte(remainder, '/'); slash >= 0 {
+		return sharePrefix + "[redacted]" + remainder[slash:]
+	}
+	return sharePrefix + "[redacted]"
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -388,6 +407,8 @@ func tokenHash(token string) string {
 }
 
 func clearCookie(w http.ResponseWriter, secure bool) {
+	// #nosec G124 -- Secure mirrors the validated deployment scheme so the
+	// deletion cookie exactly matches the cookie being removed.
 	http.SetCookie(w, &http.Cookie{Name: "pan_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: secure, SameSite: http.SameSiteLaxMode})
 }
 

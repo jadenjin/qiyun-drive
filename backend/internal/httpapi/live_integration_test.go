@@ -48,11 +48,14 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('sessions_user_expiry_idx','nodes_space_updated_idx','upload_sessions_cleanup_idx','albums_space_updated_idx','public_shares_creator_created_idx','audit_events_household_created_idx')`).Scan(&count); err != nil || count != 6 {
 			t.Fatalf("expected six critical query indexes, got %d: %v", count, err)
 		}
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE name='004_purge_claims.sql')`).Scan(&applied); err != nil || !applied {
+			t.Fatalf("purge claim migration not applied: applied=%v err=%v", applied, err)
+		}
 	})
 
 	memberID, adminID := uuid.New(), uuid.New()
 	personalSpaceID := uuid.New()
-	parentID, childID, shareFolderID, privateFolderID, albumID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	parentID, childID, shareFolderID, privateFolderID, purgeCandidateID, purgeChildID, albumID := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	accessiblePhotoID, restrictedPhotoID := uuid.New(), uuid.New()
 	accessibleAssetID, restrictedAssetID := uuid.New(), uuid.New()
 	invitationID := uuid.New()
@@ -60,6 +63,7 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 	createdSessionIDs := make([]uuid.UUID, 0, 5)
 	createdShareIDs := make([]uuid.UUID, 0, 2)
 	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM jobs WHERE kind='purge_node' AND payload->>'nodeId'=$1`, purgeCandidateID.String())
 		for _, id := range createdAuditResources {
 			_, _ = pool.Exec(ctx, `DELETE FROM audit_events WHERE resource_id=$1`, id)
 		}
@@ -67,7 +71,7 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 			_, _ = pool.Exec(ctx, `DELETE FROM public_shares WHERE id=$1`, id)
 		}
 		_, _ = pool.Exec(ctx, `DELETE FROM invitations WHERE id=$1`, invitationID)
-		_, _ = pool.Exec(ctx, `DELETE FROM nodes WHERE id IN ($1,$2,$3)`, parentID, shareFolderID, accessiblePhotoID)
+		_, _ = pool.Exec(ctx, `DELETE FROM nodes WHERE id IN ($1,$2,$3,$4,$5)`, parentID, shareFolderID, accessiblePhotoID, purgeCandidateID, purgeChildID)
 		_, _ = pool.Exec(ctx, `DELETE FROM assets WHERE id IN ($1,$2)`, accessibleAssetID, restrictedAssetID)
 		_, _ = pool.Exec(ctx, `DELETE FROM albums WHERE id=$1`, albumID)
 		for _, id := range createdSessionIDs {
@@ -101,11 +105,13 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		t.Fatalf("seed personal space: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO nodes(id,space_id,parent_id,kind,name,inherit_permissions,created_by) VALUES
-		($1,$2,NULL,'folder','stage4-parent',true,$3),
-		($4,$2,$1,'folder','stage4-restricted-child',false,$3),
-		($5,$2,NULL,'folder','stage4-family-share',false,$3),
-		($6,$7,NULL,'folder','stage4-private-share',true,$3)`, parentID, familySpaceID, memberID, childID, shareFolderID, privateFolderID, personalSpaceID); err != nil {
+		INSERT INTO nodes(id,space_id,parent_id,kind,name,inherit_permissions,created_by,deleted_at) VALUES
+		($1,$2,NULL,'folder','stage4-parent',true,$3,NULL),
+		($4,$2,$1,'folder','stage4-restricted-child',false,$3,NULL),
+		($5,$2,NULL,'folder','stage4-family-share',false,$3,NULL),
+		($6,$7,NULL,'folder','stage4-private-share',true,$3,NULL),
+		($8,$2,NULL,'folder','stage4-purge-candidate',true,$3,now()),
+		($9,$2,$8,'folder','stage4-purge-child',true,$3,now())`, parentID, familySpaceID, memberID, childID, shareFolderID, privateFolderID, personalSpaceID, purgeCandidateID, purgeChildID); err != nil {
 		t.Fatalf("seed folders: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
@@ -237,6 +243,23 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("queued purge blocks restore", func(t *testing.T) {
+		status, body := liveJSON(t, http.MethodDelete, baseURL+"/trash/"+purgeCandidateID.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusAccepted, body)
+		var purgeJobID *uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT purge_job_id FROM nodes WHERE id=$1`, purgeCandidateID).Scan(&purgeJobID); err != nil || purgeJobID == nil {
+			t.Fatalf("purge job did not claim node: id=%v err=%v", purgeJobID, err)
+		}
+		var childPurgeJobID *uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT purge_job_id FROM nodes WHERE id=$1`, purgeChildID).Scan(&childPurgeJobID); err != nil || childPurgeJobID == nil || *childPurgeJobID != *purgeJobID {
+			t.Fatalf("purge job did not claim subtree: root=%v child=%v err=%v", purgeJobID, childPurgeJobID, err)
+		}
+		status, body = liveJSON(t, http.MethodPost, baseURL+"/trash/"+purgeCandidateID.String()+"/restore", memberCookie, "", map[string]any{})
+		requireLiveStatus(t, status, http.StatusNotFound, body)
+		status, body = liveJSON(t, http.MethodPost, baseURL+"/trash/"+purgeChildID.String()+"/restore", memberCookie, "", map[string]any{})
+		requireLiveStatus(t, status, http.StatusNotFound, body)
+	})
+
 	t.Run("album creator cannot bypass revoked permission", func(t *testing.T) {
 		status, body := liveJSON(t, http.MethodDelete, baseURL+"/albums/"+albumID.String(), memberCookie, "", nil)
 		requireLiveStatus(t, status, http.StatusNotFound, body)
@@ -277,6 +300,13 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		}
 		if err := json.Unmarshal(body, &unlocked); err != nil {
 			t.Fatal(err)
+		}
+		if unlocked.AccessToken != publicToken {
+			t.Fatal("unprotected share should reuse its existing capability token")
+		}
+		var accessTokenRows int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM share_access_tokens WHERE share_id=$1`, familyShare.ID).Scan(&accessTokenRows); err != nil || accessTokenRows != 0 {
+			t.Fatalf("unprotected share created access-token rows: count=%d err=%v", accessTokenRows, err)
 		}
 		status, body = liveJSON(t, http.MethodGet, baseURL+"/public/shares/"+publicToken, "", "Bearer "+unlocked.AccessToken, nil)
 		requireLiveStatus(t, status, http.StatusOK, body)

@@ -66,6 +66,10 @@ func TestClientIPOnlyTrustsForwardedHeaderWhenConfigured(t *testing.T) {
 	if got := server.clientIP(req); got != "203.0.113.8" {
 		t.Fatalf("trusted forwarded address ignored: %s", got)
 	}
+	req.Header.Set("X-Forwarded-For", "198.51.100.9, 203.0.113.8")
+	if got := server.clientIP(req); got != "203.0.113.8" {
+		t.Fatalf("client-controlled forwarded prefix was trusted: %s", got)
+	}
 }
 
 func TestSecurityHeadersProtectAPIResponses(t *testing.T) {
@@ -87,6 +91,23 @@ func TestSecurityHeadersProtectAPIResponses(t *testing.T) {
 	}
 }
 
+func TestSafeLogPathRedactsShareCapabilities(t *testing.T) {
+	secret := "this-token-must-never-reach-logs"
+	for _, path := range []string{
+		"/api/v1/public/shares/" + secret,
+		"/api/v1/public/shares/" + secret + "/unlock",
+		"/api/v1/public/shares/" + secret + "/archive",
+	} {
+		got := safeLogPath(path)
+		if strings.Contains(got, secret) || !strings.Contains(got, "[redacted]") {
+			t.Fatalf("share path was not redacted: %q", got)
+		}
+	}
+	if got := safeLogPath("/api/v1/nodes/123"); got != "/api/v1/nodes/123" {
+		t.Fatalf("ordinary API path changed: %q", got)
+	}
+}
+
 func TestPasswordLengthHasUpperBound(t *testing.T) {
 	if err := validatePassword(strings.Repeat("a", 129)); err == nil {
 		t.Fatal("oversized password should be rejected before hashing")
@@ -102,10 +123,29 @@ func TestPreviewableMIMEAllowlist(t *testing.T) {
 			t.Errorf("expected %q to be previewable", mime)
 		}
 	}
-	for _, mime := range []string{"", "application/octet-stream", "application/zip", "application/pdfx"} {
+	for _, mime := range []string{"", "application/octet-stream", "application/zip", "application/pdfx", "text/html", "image/svg+xml", "video/x-ms-asf"} {
 		if isPreviewableMIME(mime) {
 			t.Errorf("expected %q to be rejected", mime)
 		}
+	}
+}
+
+func TestSafeArchivePathCannotEscapeArchiveRoot(t *testing.T) {
+	for input, expected := range map[string]string{
+		"family/photo.jpg":     "family/photo.jpg",
+		"../../outside.txt":    "outside.txt",
+		"\\absolute\\file.txt": "absolute/file.txt",
+		"/rooted.txt":          "rooted.txt",
+	} {
+		if got := safeArchivePath(input); got != expected {
+			t.Errorf("safeArchivePath(%q) = %q, want %q", input, got, expected)
+		}
+	}
+}
+
+func TestDownloadFilenameUsesRFC5987Encoding(t *testing.T) {
+	if got := pathEscape("家庭;照片.zip"); got != "%E5%AE%B6%E5%BA%AD%3B%E7%85%A7%E7%89%87.zip" {
+		t.Fatalf("unexpected encoded filename: %q", got)
 	}
 }
 

@@ -20,7 +20,7 @@ type UploadSession = {
 };
 
 type Part = { partNumber: number; etag: string };
-export type ResumableUpload = { key: string; session: UploadSession; file: File; parts: Part[]; partSize: number; updatedAt: number; albumId?: string };
+export type ResumableUpload = { key: string; ownerUserId: string; session: UploadSession; file: File; parts: Part[]; partSize: number; updatedAt: number; albumId?: string };
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/v1";
 
@@ -115,7 +115,22 @@ export async function clearResumeState(key: string) {
   });
 }
 
-export async function loadResumableUploads(): Promise<ResumableUpload[]> {
+export async function clearAllResumeState() {
+  if (!("indexedDB" in window)) return;
+  await new Promise<void>((resolve) => {
+    const request = indexedDB.open("pan-upload-queue", 1);
+    request.onupgradeneeded = () => request.result.createObjectStore("uploads");
+    request.onerror = () => resolve();
+    request.onsuccess = () => {
+      const tx = request.result.transaction("uploads", "readwrite");
+      tx.objectStore("uploads").clear();
+      tx.oncomplete = () => { request.result.close(); resolve(); };
+      tx.onerror = () => { request.result.close(); resolve(); };
+    };
+  });
+}
+
+export async function loadResumableUploads(ownerUserId: string): Promise<ResumableUpload[]> {
   if (!("indexedDB" in window)) return [];
   return new Promise((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
@@ -128,8 +143,8 @@ export async function loadResumableUploads(): Promise<ResumableUpload[]> {
       cursor.onsuccess = () => {
         if (!cursor.result) return;
         const value = cursor.result.value as Partial<ResumableUpload>;
-        if (value.session && value.file instanceof File) {
-          results.push({ key: String(cursor.result.key), session: value.session, file: value.file, parts: value.parts || [], partSize: value.partSize || 16 * 1024 * 1024, updatedAt: value.updatedAt || 0, albumId: value.albumId });
+        if (value.ownerUserId === ownerUserId && value.session && value.file instanceof File) {
+          results.push({ key: String(cursor.result.key), ownerUserId, session: value.session, file: value.file, parts: value.parts || [], partSize: value.partSize || 16 * 1024 * 1024, updatedAt: value.updatedAt || 0, albumId: value.albumId });
         }
         cursor.result.continue();
       };
@@ -169,6 +184,7 @@ export async function uploadFile(
     batchId?: string;
     albumId?: string;
     section?: UploadSection;
+    ownerUserId: string;
     resumeKey?: string;
     signal: AbortSignal;
     onProgress: (value: number) => void;
@@ -190,7 +206,7 @@ export async function uploadFile(
     signal: options.signal,
   });
   const resumeKey = options.resumeKey || `${session.id}:${file.name}:${file.size}:${file.lastModified}`;
-  await saveResumeState(resumeKey, { session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now(), albumId: options.albumId });
+  await saveResumeState(resumeKey, { ownerUserId: options.ownerUserId, session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now(), albumId: options.albumId });
 
   if (session.method === "put") {
     await putBlob(session.url!, file, file.type, options.signal, (loaded) => options.onProgress(loaded / Math.max(1, file.size)));
@@ -232,7 +248,7 @@ export async function uploadFile(
         }),
       );
       completed.push(...results);
-      await saveResumeState(resumeKey, { session, file, parts: completed, partSize, updatedAt: Date.now(), albumId: options.albumId });
+      await saveResumeState(resumeKey, { ownerUserId: options.ownerUserId, session, file, parts: completed, partSize, updatedAt: Date.now(), albumId: options.albumId });
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);

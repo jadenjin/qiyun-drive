@@ -93,7 +93,7 @@ func (w *worker) runOne(ctx context.Context) error {
 	case "index_photo":
 		err = w.indexPhoto(jobCtx, j.Payload)
 	case "purge_node":
-		err = w.purgeNode(jobCtx, j.Payload)
+		err = w.purgeNode(jobCtx, j.ID, j.Payload)
 	case "cleanup_upload":
 		err = w.cleanupUpload(jobCtx, j.Payload)
 	default:
@@ -105,6 +105,11 @@ func (w *worker) runOne(ctx context.Context) error {
 	}
 	backoff := time.Duration(1<<min(j.Attempts, 5)) * time.Minute
 	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error=$1,run_after=$2,updated_at=now() WHERE id=$3`, truncateError(err), time.Now().Add(backoff), j.ID)
+	if j.Kind == "purge_node" && j.Attempts+1 >= 6 {
+		// Give the user a recovery path after the final failed attempt. A later
+		// maintenance pass may claim the still-deleted node again.
+		_, _ = w.db.Exec(ctx, `UPDATE nodes SET purge_job_id=NULL WHERE purge_job_id=$1`, j.ID)
+	}
 	return err
 }
 
@@ -141,13 +146,17 @@ func (w *worker) indexPhoto(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	// #nosec G304 -- inputPath is generated beneath the private temporary
+	// directory created immediately above, never from request or database data.
 	file, err := os.Create(inputPath)
 	if err != nil {
-		body.Close()
+		_ = body.Close()
 		return err
 	}
 	_, err = io.Copy(file, body)
-	body.Close()
+	if closeErr := body.Close(); err == nil {
+		err = closeErr
+	}
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}
@@ -155,9 +164,12 @@ func (w *worker) indexPhoto(ctx context.Context, payload []byte) error {
 		return err
 	}
 	smallPath, largePath := filepath.Join(tempDir, "small.webp"), filepath.Join(tempDir, "large.webp")
+	// #nosec G204 -- Arguments are fixed or generated beneath this job's private
+	// temporary directory; CommandContext does not invoke a shell.
 	if output, err := exec.CommandContext(ctx, "vips", "thumbnail", inputPath, smallPath, "320", "--height", "320", "--crop", "centre").CombinedOutput(); err != nil {
 		return fmt.Errorf("small thumbnail: %w: %s", err, string(output))
 	}
+	// #nosec G204 -- See the small-thumbnail invocation above.
 	if output, err := exec.CommandContext(ctx, "vips", "thumbnail", inputPath, largePath, "1600", "--height", "1600").CombinedOutput(); err != nil {
 		return fmt.Errorf("large thumbnail: %w: %s", err, string(output))
 	}
@@ -174,6 +186,8 @@ func (w *worker) indexPhoto(ctx context.Context, payload []byte) error {
 }
 
 func putFile(ctx context.Context, store *storage.Store, key, path string) error {
+	// #nosec G304 -- Every caller passes a path generated beneath a private
+	// os.MkdirTemp directory, never a request or database value.
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -194,6 +208,8 @@ type photoMetadata struct {
 }
 
 func readMetadata(ctx context.Context, inputPath string) photoMetadata {
+	// #nosec G204 -- inputPath is generated beneath a private temporary
+	// directory and no shell is involved.
 	output, err := exec.CommandContext(ctx, "exiftool", "-json", "-DateTimeOriginal", "-OffsetTimeOriginal", "-ImageWidth", "-ImageHeight", "-Make", "-Model", inputPath).Output()
 	if err != nil {
 		return photoMetadata{}
@@ -237,7 +253,7 @@ func numberToInt(value any) (int, bool) {
 	}
 }
 
-func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
+func (w *worker) purgeNode(ctx context.Context, jobID uuid.UUID, payload []byte) error {
 	var input struct {
 		NodeID string `json:"nodeId"`
 	}
@@ -248,10 +264,39 @@ func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	claimTx, err := w.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer claimTx.Rollback(ctx)
+	if _, err := claimTx.Exec(ctx, `
+		WITH RECURSIVE tree AS (
+		  SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id=$2
+		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL
+		)
+		UPDATE nodes n SET purge_job_id=$2 FROM tree t
+		WHERE n.id=t.id AND n.deleted_at IS NOT NULL AND (n.purge_job_id IS NULL OR n.purge_job_id=$2)`, nodeID, jobID); err != nil {
+		return err
+	}
+	var conflictingClaim bool
+	if err := claimTx.QueryRow(ctx, `
+		WITH RECURSIVE tree AS (
+		  SELECT id,purge_job_id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id=$2
+		  UNION ALL SELECT n.id,n.purge_job_id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL
+		)
+		SELECT EXISTS(SELECT 1 FROM tree WHERE purge_job_id IS DISTINCT FROM $2)`, nodeID, jobID).Scan(&conflictingClaim); err != nil {
+		return err
+	}
+	if conflictingClaim {
+		return fmt.Errorf("purge subtree has a conflicting claim")
+	}
+	if err := claimTx.Commit(ctx); err != nil {
+		return err
+	}
 	rows, err := w.db.Query(ctx, `
-		WITH RECURSIVE tree AS (SELECT id FROM nodes WHERE id=$1 UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id)
+		WITH RECURSIVE tree AS (SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id=$2 UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL AND n.purge_job_id=$2)
 		SELECT a.id,a.space_id,a.object_key,a.size_bytes,p.thumb_small_key,p.thumb_large_key
-		FROM nodes n JOIN tree t ON t.id=n.id JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id`, nodeID)
+		FROM nodes n JOIN tree t ON t.id=n.id JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id`, nodeID, jobID)
 	if err != nil {
 		return err
 	}
@@ -271,6 +316,13 @@ func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
 		items = append(items, item)
 	}
 	rows.Close()
+	var claimed bool
+	if err := w.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id=$2)`, nodeID, jobID).Scan(&claimed); err != nil {
+		return err
+	}
+	if !claimed {
+		return nil
+	}
 	for _, item := range items {
 		if err := w.store.Delete(ctx, item.key); err != nil {
 			return err
@@ -289,8 +341,12 @@ func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
 	defer tx.Rollback(ctx)
 	// Delete the node tree first. Deleting an asset while a file node still
 	// references it would set nodes.asset_id to NULL and violate nodes_check.
-	if _, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id=$1`, nodeID); err != nil {
+	result, err := tx.Exec(ctx, `DELETE FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id=$2`, nodeID, jobID)
+	if err != nil {
 		return err
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("purge claim was lost")
 	}
 	for _, item := range items {
 		if _, err := tx.Exec(ctx, `DELETE FROM assets WHERE id=$1`, item.assetID); err != nil {
@@ -305,18 +361,29 @@ func (w *worker) purgeNode(ctx context.Context, payload []byte) error {
 
 func (w *worker) runMaintenance(ctx context.Context) {
 	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error='任务执行中断，已自动恢复',run_after=now(),updated_at=now() WHERE state='running' AND locked_at<now()-interval '15 minutes'`)
+	// Reconcile the narrow crash window between a purge job exhausting its
+	// retries and runOne releasing the claim, so a deleted node cannot become
+	// permanently impossible to restore.
+	_, _ = w.db.Exec(ctx, `UPDATE nodes n SET purge_job_id=NULL WHERE n.purge_job_id IS NOT NULL AND NOT EXISTS (
+		SELECT 1 FROM jobs j WHERE j.id=n.purge_job_id AND (j.state IN ('pending','running') OR (j.state='failed' AND j.attempts<6))
+	)`)
 	w.enqueueExpiredUploadCleanup(ctx)
 	_, _ = w.db.Exec(ctx, `DELETE FROM sessions WHERE expires_at<now()`)
 	_, _ = w.db.Exec(ctx, `DELETE FROM share_access_tokens WHERE expires_at<now()`)
 	_, _ = w.db.Exec(ctx, `DELETE FROM invitations WHERE (accepted_at IS NOT NULL OR expires_at<now()) AND created_at<now()-interval '30 days'`)
 	_, _ = w.db.Exec(ctx, `DELETE FROM password_resets WHERE (used_at IS NOT NULL OR expires_at<now()) AND created_at<now()-interval '30 days'`)
 	_, _ = w.db.Exec(ctx, `
-		INSERT INTO jobs(id,kind,payload)
-		SELECT gen_random_uuid(),'purge_node',jsonb_build_object('nodeId',n.id::text)
-		FROM nodes n WHERE n.deleted_at<now()-$1::interval
+		WITH candidates AS (
+			SELECT n.id FROM nodes n WHERE n.deleted_at<now()-$1::interval AND n.purge_job_id IS NULL
 		AND NOT EXISTS(SELECT 1 FROM nodes p WHERE p.id=n.parent_id AND p.deleted_at IS NOT NULL)
 		AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='purge_node' AND (j.state IN ('pending','running') OR (j.state='failed' AND (j.attempts<6 OR j.updated_at>now()-interval '24 hours'))) AND j.payload->>'nodeId'=n.id::text)
-		LIMIT 25`, durationInterval(w.cfg.TrashRetention))
+		ORDER BY n.deleted_at LIMIT 25
+		), claims AS (
+			UPDATE nodes n SET purge_job_id=gen_random_uuid() FROM candidates c WHERE n.id=c.id
+			RETURNING n.id,n.purge_job_id
+		)
+		INSERT INTO jobs(id,kind,payload)
+		SELECT purge_job_id,'purge_node',jsonb_build_object('nodeId',id::text) FROM claims`, durationInterval(w.cfg.TrashRetention))
 }
 
 func (w *worker) enqueueExpiredUploadCleanup(ctx context.Context) {

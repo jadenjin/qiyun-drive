@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"regexp"
 	"strings"
@@ -417,7 +418,7 @@ func (s *Server) restoreNode(w http.ResponseWriter, r *http.Request) {
 	var spaceID uuid.UUID
 	var name, section string
 	var originalParent *uuid.UUID
-	if err := s.db.QueryRow(r.Context(), `SELECT space_id,name,section,original_parent_id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL`, id).Scan(&spaceID, &name, &section, &originalParent); err != nil {
+	if err := s.db.QueryRow(r.Context(), `SELECT space_id,name,section,original_parent_id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id IS NULL`, id).Scan(&spaceID, &name, &section, &originalParent); err != nil {
 		dbNotFound(w, err)
 		return
 	}
@@ -440,14 +441,18 @@ func (s *Server) restoreNode(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	_, err = s.db.Exec(r.Context(), `
+	result, err := s.db.Exec(r.Context(), `
 		WITH RECURSIVE tree AS (
-		  SELECT id FROM nodes WHERE id=$1
-		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id
+		  SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NOT NULL AND purge_job_id IS NULL
+		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL AND n.purge_job_id IS NULL
 		)
 		UPDATE nodes SET deleted_at=NULL,updated_at=now(),parent_id=CASE WHEN id=$1 THEN $2 ELSE parent_id END,name=CASE WHEN id=$1 THEN $3 ELSE name END WHERE id IN (SELECT id FROM tree)`, id, originalParent, name)
 	if err != nil {
 		internalError(w, err)
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusConflict, "purge_pending", "永久删除任务已在处理中")
 		return
 	}
 	s.audit(r.Context(), a, "node.restore", "node", &id, map[string]any{"name": name, "parentId": originalParent})
@@ -479,7 +484,47 @@ func (s *Server) purgeNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "subtree_forbidden", "目录中包含你无权永久删除的内容")
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'purge_node',jsonb_build_object('nodeId',$2::text))`, uuid.New(), id.String()); err != nil {
+	jobID := uuid.New()
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err := tx.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'purge_node',jsonb_build_object('nodeId',$2::text))`, jobID, id.String()); err != nil {
+		internalError(w, err)
+		return
+	}
+	result, err := tx.Exec(r.Context(), `
+		WITH RECURSIVE tree AS (
+		  SELECT id FROM nodes WHERE id=$2 AND deleted_at IS NOT NULL AND purge_job_id IS NULL
+		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL
+		)
+		UPDATE nodes n SET purge_job_id=$1 FROM tree t
+		WHERE n.id=t.id AND n.deleted_at IS NOT NULL AND n.purge_job_id IS NULL`, jobID, id)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusConflict, "purge_pending", "永久删除任务已在处理中")
+		return
+	}
+	var conflictingClaim bool
+	if err := tx.QueryRow(r.Context(), `
+		WITH RECURSIVE tree AS (
+		  SELECT id,purge_job_id FROM nodes WHERE id=$1
+		  UNION ALL SELECT n.id,n.purge_job_id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NOT NULL
+		)
+		SELECT EXISTS(SELECT 1 FROM tree WHERE purge_job_id IS DISTINCT FROM $2)`, id, jobID).Scan(&conflictingClaim); err != nil {
+		internalError(w, err)
+		return
+	}
+	if conflictingClaim {
+		writeError(w, http.StatusConflict, "purge_pending", "目录中已有永久删除任务")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		internalError(w, err)
 		return
 	}
@@ -565,10 +610,25 @@ func (s *Server) previewFile(w http.ResponseWriter, r *http.Request) {
 
 func isPreviewableMIME(mime string) bool {
 	base := strings.ToLower(strings.TrimSpace(strings.Split(mime, ";")[0]))
-	return strings.HasPrefix(base, "image/") || strings.HasPrefix(base, "video/") || strings.HasPrefix(base, "audio/") || strings.HasPrefix(base, "text/") || base == "application/pdf"
+	switch base {
+	case "image/jpeg", "image/png", "image/webp", "image/gif", "image/heic", "image/heif",
+		"video/mp4", "video/webm", "video/ogg", "video/quicktime",
+		"audio/mpeg", "audio/ogg", "audio/wav", "audio/webm", "audio/mp4", "audio/flac",
+		"text/plain", "text/csv", "text/markdown", "application/json", "application/pdf":
+		return true
+	default:
+		return false
+	}
 }
 
 type archiveEntry struct{ Name, Key string }
+
+func safeArchivePath(name string) string {
+	// Prefix with a synthetic root before cleaning so legacy or corrupted
+	// database values cannot create absolute or parent-traversing ZIP entries.
+	name = strings.ReplaceAll(name, "\\", "/")
+	return strings.TrimPrefix(path.Clean("/"+name), "/")
+}
 
 func (s *Server) downloadArchive(w http.ResponseWriter, r *http.Request) {
 	a := actorFrom(r)
@@ -620,11 +680,13 @@ func (s *Server) downloadArchive(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		part, err := zw.Create(strings.ReplaceAll(entry.Name, "\\", "/"))
+		part, err := zw.Create(safeArchivePath(entry.Name))
 		if err == nil {
 			_, err = io.Copy(part, body)
 		}
-		body.Close()
+		if closeErr := body.Close(); err == nil {
+			err = closeErr
+		}
 		if err != nil {
 			return
 		}
@@ -632,7 +694,7 @@ func (s *Server) downloadArchive(w http.ResponseWriter, r *http.Request) {
 }
 
 func pathEscape(value string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(value, " ", "%20"), "\"", "")
+	return url.PathEscape(value)
 }
 
 func (s *Server) updateQuota(w http.ResponseWriter, r *http.Request) {

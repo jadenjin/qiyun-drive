@@ -53,7 +53,14 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, type UploadSection, type UploadTask } from "./upload-client";
+import { api, clearAllResumeState, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, type UploadSection, type UploadTask } from "./upload-client";
+
+function navigateToDownload(url: string) {
+  const link = document.createElement("a");
+  link.href = url;
+  link.rel = "noopener";
+  link.click();
+}
 
 type View = "files" | "photos" | "albums" | "shares" | "trash" | "family";
 type Space = { id: string; kind: "personal" | "family"; name: string; quotaBytes: number; usedBytes: number; reservedBytes: number; permission: string };
@@ -363,15 +370,16 @@ export function CloudDrive() {
   }, [activeModal]);
 
   useEffect(() => {
-    if (status !== "ready" || resumeAttempted.current) return;
+    if (status !== "ready" || !currentUser || resumeAttempted.current) return;
     resumeAttempted.current = true;
     (async () => {
-      const pending = await loadResumableUploads();
+      const pending = await loadResumableUploads(currentUser.id);
       if (!pending.length) return;
       const tasks: UploadTask[] = pending.map((item) => ({ id: item.key, name: item.file.name, relativePath: item.file.webkitRelativePath || item.file.name, size: item.file.size, progress: 0, state: "uploading" }));
       setUploads((current) => [...tasks, ...current]);
       await Promise.all(pending.map(async (item) => {
         const controller = new AbortController();
+        uploadControllers.current.set(item.key, controller);
         try {
           const nodeId = await resumeMultipartUpload(item, controller.signal, (progress) => setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress } : task)));
           if (item.albumId && nodeId) {
@@ -386,11 +394,13 @@ export function CloudDrive() {
           const message = error instanceof Error ? error.message : "恢复上传失败";
           setUploads((items) => items.map((task) => task.id === item.key ? { ...task, state: "failed", error: message } : task));
           if (/过期|不存在/.test(message)) await clearResumeState(item.key);
+        } finally {
+          uploadControllers.current.delete(item.key);
         }
       }));
       await refreshView();
     })();
-  }, [refreshView, status]);
+  }, [currentUser, refreshView, status]);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -430,6 +440,9 @@ export function CloudDrive() {
   };
 
   const logout = async () => {
+    uploadControllers.current.forEach((controller) => controller.abort());
+    uploadControllers.current.clear();
+    await clearAllResumeState();
     try { await api("/auth/logout", { method: "POST" }); } catch { /* cookie is cleared by a successful server response only */ }
     setAccountOpen(false);
     setCurrentUser(null);
@@ -438,6 +451,8 @@ export function CloudDrive() {
     setSelectedAlbum(null);
     setPhotoViewer(null);
     setFilePreview(null);
+    setUploads([]);
+    resumeAttempted.current = false;
   };
 
   const updateProfile = async (displayName: string) => {
@@ -537,6 +552,10 @@ export function CloudDrive() {
       showToast(`已加入 ${selected.length} 个${section === "photos" ? "照片" : "文件"}（界面预览）`);
       return;
     }
+    if (!currentUser) {
+      showToast("登录状态已失效，请重新登录");
+      return;
+    }
     let batchId: string | undefined;
     if (section === "files") {
       try { batchId = await createFolderBatch(spaceId, currentParent, selected); } catch (error) { showToast(error instanceof Error ? error.message : "无法创建上传任务"); return; }
@@ -555,7 +574,7 @@ export function CloudDrive() {
         uploadControllers.current.set(task.id, controller);
         setUploads((items) => items.map((item) => item.id === task.id ? { ...item, state: "uploading" } : item));
         try {
-          const nodeId = await uploadFile(file, { spaceId, parentId: section === "photos" ? null : currentParent, batchId, albumId, section, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
+          const nodeId = await uploadFile(file, { spaceId, parentId: section === "photos" ? null : currentParent, batchId, albumId, section, ownerUserId: currentUser.id, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
           uploadedNodeIds.push(nodeId);
           setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress: 1, state: "ready" } : item));
         } catch (error) {
@@ -655,12 +674,13 @@ export function CloudDrive() {
   const downloadPhoto = async (photo: PhotoItem) => {
     try {
       const result = await api<{ url: string }>(`/nodes/${photo.nodeId}/download`);
-      window.location.href = result.url;
+      navigateToDownload(result.url);
     } catch (error) { showToast(error instanceof Error ? error.message : "下载失败"); }
   };
 
   const resumeTask = async (taskId: string) => {
-    const pending = await loadResumableUploads();
+    if (!currentUser) return;
+    const pending = await loadResumableUploads(currentUser.id);
     const resumable = pending.find((item) => item.key === taskId || taskId.includes(item.session.id));
     if (!resumable) { showToast("上传会话已失效，请重新选择文件"); return; }
     const controller = new AbortController();
@@ -688,10 +708,10 @@ export function CloudDrive() {
     if (status === "preview") { showToast(`准备下载 ${item.name}`); return; }
     try {
       if (item.kind === "folder") {
-        window.location.href = `${process.env.NEXT_PUBLIC_API_BASE || "/api/v1"}/nodes/${item.id}/archive`;
+        navigateToDownload(`${process.env.NEXT_PUBLIC_API_BASE || "/api/v1"}/nodes/${item.id}/archive`);
       } else {
         const result = await api<{ url: string }>(`/nodes/${item.id}/download`);
-        window.location.href = result.url;
+        navigateToDownload(result.url);
       }
     } catch (error) { showToast(error instanceof Error ? error.message : "下载失败"); }
   };
@@ -1086,7 +1106,7 @@ function FilePreviewDialog({ value, onClose, onDownload }: { value: FilePreviewS
       ? <video src={value.url} controls />
       : mime.startsWith("audio/")
         ? <div className="audio-preview"><File size={42} /><strong>{value.item.name}</strong><audio src={value.url} controls /></div>
-        : <iframe src={value.url} title={`预览 ${value.item.name}`} />;
+        : <iframe src={value.url} title={`预览 ${value.item.name}`} sandbox="" referrerPolicy="no-referrer" />;
   return <div className="file-preview" role="dialog" aria-modal="true" aria-label={`预览文件 ${value.item.name}`}><header><span><Eye size={18} /><strong>{value.item.name}</strong><small>{value.mimeType}</small></span><span><button onClick={onDownload}><Download size={16} /> 下载</button><button onClick={onClose} aria-label="关闭文件预览"><X size={19} /></button></span></header><div className="file-preview-stage">{content}</div></div>;
 }
 

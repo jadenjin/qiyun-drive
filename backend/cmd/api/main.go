@@ -37,7 +37,14 @@ func main() {
 		slog.Error("object storage unavailable", "error", err)
 		os.Exit(1)
 	}
-	server := &http.Server{Addr: cfg.Addr, Handler: httpapi.New(db, store, cfg), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	server := &http.Server{
+		Addr:              cfg.Addr,
+		Handler:           httpapi.New(db, store, cfg),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
 	go func() {
 		slog.Info("api listening", "addr", cfg.Addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

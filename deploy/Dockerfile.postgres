@@ -1,0 +1,6 @@
+ARG POSTGRES_IMAGE=postgres:17.11-alpine
+FROM ${POSTGRES_IMAGE}
+USER root
+RUN apk upgrade --no-cache \
+ && rm -f /usr/local/bin/gosu
+USER postgres

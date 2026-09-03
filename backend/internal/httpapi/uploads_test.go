@@ -1,6 +1,10 @@
 package httpapi
 
-import "testing"
+import (
+	"testing"
+
+	"pan/backend/internal/storage"
+)
 
 func TestCleanRelativePathRejectsTraversal(t *testing.T) {
 	invalid := []string{"../secret.txt", "/root/file", "folder/../../secret", "folder/bad:name"}
@@ -66,5 +70,23 @@ func TestPhotoIndexingRequiresPhotoSection(t *testing.T) {
 	}
 	if shouldIndexPhoto("photos", "application/pdf") {
 		t.Fatal("non-image upload must not enter the photo timeline")
+	}
+}
+
+func TestCompletedMultipartPartsAreBoundedAndUnique(t *testing.T) {
+	valid := []storage.CompletedPart{{Number: 1, ETag: `"etag-1"`}, {Number: 2, ETag: `"etag-2"`}}
+	if !validCompletedParts(valid) {
+		t.Fatal("valid completed parts were rejected")
+	}
+	for _, parts := range [][]storage.CompletedPart{
+		nil,
+		{{Number: 0, ETag: `"etag"`}},
+		{{Number: 1, ETag: ""}},
+		{{Number: 1, ETag: "bad\r\nheader"}},
+		{{Number: 1, ETag: `"first"`}, {Number: 1, ETag: `"duplicate"`}},
+	} {
+		if validCompletedParts(parts) {
+			t.Fatalf("invalid completed parts accepted: %#v", parts)
+		}
 	}
 }

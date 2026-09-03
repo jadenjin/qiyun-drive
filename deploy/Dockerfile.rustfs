@@ -1,0 +1,5 @@
+ARG RUSTFS_IMAGE=rustfs/rustfs:1.0.0-rc.2
+FROM ${RUSTFS_IMAGE}
+USER root
+RUN apk upgrade --no-cache
+USER rustfs

@@ -99,11 +99,22 @@ func (c Config) Validate() error {
 	if publicURL.Scheme == "http" && !isPrivateOrLoopbackHost(publicURL.Hostname()) {
 		return fmt.Errorf("PUBLIC_BASE_URL must use HTTPS outside localhost or a private network")
 	}
-	if _, err := validateHTTPURL("S3_ENDPOINT", c.S3Endpoint); err != nil {
+	s3Endpoint, err := validateHTTPURL("S3_ENDPOINT", c.S3Endpoint)
+	if err != nil {
 		return err
 	}
-	if _, err := validateHTTPURL("S3_PUBLIC_ENDPOINT", c.S3PublicEndpoint); err != nil {
+	if s3Endpoint.RawQuery != "" || s3Endpoint.Fragment != "" {
+		return fmt.Errorf("S3_ENDPOINT must not contain a query or fragment")
+	}
+	s3PublicEndpoint, err := validateHTTPURL("S3_PUBLIC_ENDPOINT", c.S3PublicEndpoint)
+	if err != nil {
 		return err
+	}
+	if s3PublicEndpoint.RawQuery != "" || s3PublicEndpoint.Fragment != "" {
+		return fmt.Errorf("S3_PUBLIC_ENDPOINT must not contain a query or fragment")
+	}
+	if s3PublicEndpoint.Scheme == "http" && !isPrivateOrLoopbackHost(s3PublicEndpoint.Hostname()) {
+		return fmt.Errorf("S3_PUBLIC_ENDPOINT must use HTTPS outside localhost or a private network")
 	}
 	databaseURL, err := url.Parse(c.DatabaseURL)
 	if err != nil || (databaseURL.Scheme != "postgres" && databaseURL.Scheme != "postgresql") || databaseURL.Host == "" {
@@ -112,8 +123,8 @@ func (c Config) Validate() error {
 	if len(c.S3AccessKey) < 3 {
 		return fmt.Errorf("S3_ACCESS_KEY must contain at least 3 characters")
 	}
-	if len(c.S3SecretKey) < 8 || c.S3SecretKey == "change-me-now" {
-		return fmt.Errorf("S3_SECRET_KEY must be replaced with a secret of at least 8 characters")
+	if len(c.S3SecretKey) < 16 || c.S3SecretKey == "change-me-now" {
+		return fmt.Errorf("S3_SECRET_KEY must be replaced with a secret of at least 16 characters")
 	}
 	if c.PresignTTL < time.Minute || c.PresignTTL > time.Hour {
 		return fmt.Errorf("PRESIGN_TTL must be between 1m and 1h")

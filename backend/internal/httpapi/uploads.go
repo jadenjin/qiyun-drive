@@ -426,11 +426,17 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items := make([]map[string]any, 0, len(input.PartNumbers))
+	seen := make(map[int32]struct{}, len(input.PartNumbers))
 	for _, number := range input.PartNumbers {
 		if number < 1 || number > 10000 {
 			writeError(w, http.StatusBadRequest, "invalid_parts", "分片编号不合法")
 			return
 		}
+		if _, exists := seen[number]; exists {
+			writeError(w, http.StatusBadRequest, "invalid_parts", "分片编号不能重复")
+			return
+		}
+		seen[number] = struct{}{}
 		url, err := s.store.PresignPart(r.Context(), upload.ObjectKey, *upload.UploadID, number)
 		if err != nil {
 			internalError(w, err)
@@ -509,7 +515,7 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if upload.Method == "multipart" {
-		if upload.UploadID == nil || len(input.Parts) == 0 {
+		if upload.UploadID == nil || !validCompletedParts(input.Parts) {
 			writeError(w, http.StatusBadRequest, "invalid_parts", "缺少已上传分片")
 			return
 		}
@@ -576,6 +582,23 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(r.Context(), `SELECT name FROM nodes WHERE id=$1`, upload.NodeID).Scan(&uploadedName)
 	s.audit(r.Context(), a, "node.upload", "node", &upload.NodeID, map[string]any{"name": uploadedName, "sizeBytes": actualSize})
 	writeJSON(w, http.StatusOK, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "ready"})
+}
+
+func validCompletedParts(parts []storage.CompletedPart) bool {
+	if len(parts) == 0 || len(parts) > 10000 {
+		return false
+	}
+	seen := make(map[int32]struct{}, len(parts))
+	for _, part := range parts {
+		if part.Number < 1 || part.Number > 10000 || len(part.ETag) == 0 || len(part.ETag) > 256 || strings.ContainsAny(part.ETag, "\r\n") {
+			return false
+		}
+		if _, exists := seen[part.Number]; exists {
+			return false
+		}
+		seen[part.Number] = struct{}{}
+	}
+	return true
 }
 
 func isPhotoMime(mime string) bool {

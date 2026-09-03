@@ -8,8 +8,22 @@ x-logging: &default_logging
 
 services:
   caddy:
-    image: caddy:2.10-alpine
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.caddy
+    image: qiyun-drive-caddy:2.11.4
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864
+      - /config:rw,noexec,nosuid,nodev,size=16777216,uid=10002,gid=10002,mode=0750
     logging: *default_logging
     ports:
       - "80:80"
@@ -19,7 +33,7 @@ services:
       SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
+      - caddy_data_v2:/data
     depends_on:
       web:
         condition: service_healthy
@@ -31,6 +45,14 @@ services:
       context: .
       target: web
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864,uid=1000,gid=1000,mode=0700
     logging: *default_logging
     environment:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost}
@@ -46,6 +68,12 @@ services:
       context: ./backend
     command: ["pan-api"]
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
     logging: *default_logging
     environment: &backend_environment
       ADDR: :8080
@@ -80,6 +108,15 @@ services:
       context: ./backend
     command: ["pan-worker"]
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 1g
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=536870912
     logging: *default_logging
     environment: *backend_environment
     depends_on:
@@ -87,8 +124,19 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:17-alpine
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.postgres
+      args:
+        POSTGRES_IMAGE: ${POSTGRES_IMAGE:-postgres:17.11-alpine}
+    image: qiyun-drive-postgres:17.11-alpine
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
     logging: *default_logging
     ports:
       - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:5432:5432"
@@ -98,6 +146,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864
+      - /var/run/postgresql:rw,noexec,nosuid,nodev,size=16777216,uid=70,gid=70,mode=3777
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pan -d pan"]
       interval: 5s
@@ -105,8 +156,19 @@ services:
       retries: 20
 
   rustfs:
-    image: ${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-rc.2}
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.rustfs
+      args:
+        RUSTFS_IMAGE: ${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-rc.2}
+    image: qiyun-drive-rustfs:${RUSTFS_VERSION:-1.0.0-rc.2}
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
     logging: *default_logging
     ports:
       - "${RUSTFS_BIND_ADDRESS:-127.0.0.1}:9000:9000"
@@ -121,6 +183,9 @@ services:
       RUSTFS_OBS_LOGGER_LEVEL: warn
     volumes:
       - rustfs_data:/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=67108864
+      - /logs:rw,noexec,nosuid,nodev,size=67108864,uid=10001,gid=10001,mode=0750
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/health"]
       interval: 10s
@@ -131,4 +196,4 @@ services:
 volumes:
   postgres_data:
   rustfs_data:
-  caddy_data:
+  caddy_data_v2:

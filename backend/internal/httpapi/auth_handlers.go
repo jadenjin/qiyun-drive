@@ -13,6 +13,13 @@ import (
 
 func authTokenHash(token string) string { return panAuth.TokenHash(token) }
 
+// Keep unknown-user logins on the same Argon2 path as known users. The
+// all-zero digest can never be a stored password hash, but it has valid,
+// bounded parameters so username existence is not exposed through timing.
+// #nosec G101 -- This fixed public Argon2 verifier only equalizes login timing;
+// it is not assigned to an account and cannot grant authentication.
+const dummyPasswordHash = "$argon2id$v=19$m=65536,t=2,p=2$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 func (s *Server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
 	var initialized bool
 	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM households)`).Scan(&initialized); err != nil {
@@ -106,9 +113,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var userID uuid.UUID
-	var passwordHash string
+	passwordHash := dummyPasswordHash
 	err := s.db.QueryRow(r.Context(), `SELECT id,password_hash FROM users WHERE lower(username)=$1 AND NOT disabled`, normalizeUsername(input.Username)).Scan(&userID, &passwordHash)
-	if err != nil || !panAuth.VerifyPassword(passwordHash, input.Password) {
+	passwordOK := panAuth.VerifyPassword(passwordHash, input.Password)
+	if err != nil || !passwordOK {
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
 		return
 	}
@@ -126,6 +134,8 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request, userID uu
 		internalError(w, err)
 		return
 	}
+	// #nosec G124 -- Secure is configuration-dependent because trusted private
+	// LAN HTTP is supported; config validation requires it for every HTTPS URL.
 	http.SetCookie(w, &http.Cookie{Name: "pan_session", Value: plain, Path: "/", Expires: expires, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

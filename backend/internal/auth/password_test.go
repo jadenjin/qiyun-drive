@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestPasswordRoundTrip(t *testing.T) {
 	hash, err := HashPassword("a-safe-family-password")
@@ -12,6 +15,25 @@ func TestPasswordRoundTrip(t *testing.T) {
 	}
 	if VerifyPassword(hash, "wrong-password") {
 		t.Fatal("wrong password must not verify")
+	}
+}
+
+func TestVerifyPasswordRejectsUntrustedHashParameters(t *testing.T) {
+	hash, err := HashPassword("a-safe-family-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid := []string{
+		strings.Replace(hash, "v=19", "v=16", 1),
+		strings.Replace(hash, "m=65536", "m=4294967295", 1),
+		strings.Replace(hash, "t=2", "t=99", 1),
+		strings.Replace(hash, "p=2", "p=255", 1),
+		hash[:strings.LastIndex(hash, "$")+1] + "AA",
+	}
+	for _, encoded := range invalid {
+		if VerifyPassword(encoded, "a-safe-family-password") {
+			t.Fatalf("accepted hash with unsupported parameters: %q", encoded)
+		}
 	}
 }
 

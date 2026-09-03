@@ -1,23 +1,24 @@
 {$SITE_ADDRESS:http://localhost} {
-  encode zstd gzip
+	encode zstd gzip
 
-  header {
-    -Server
-    X-Content-Type-Options "nosniff"
-    X-Frame-Options "DENY"
-    Referrer-Policy "strict-origin-when-cross-origin"
-    Permissions-Policy "camera=(), microphone=(), geolocation=()"
-  }
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		Content-Security-Policy "base-uri 'self'; frame-ancestors 'none'; object-src 'none'"
+	}
 
-  handle /api/* {
-    reverse_proxy api:8080
-  }
+	handle /api/* {
+		reverse_proxy api:8080
+	}
 
-  handle /health/* {
-    reverse_proxy api:8080
-  }
+	handle /health/* {
+		reverse_proxy api:8080
+	}
 
-  handle {
-    reverse_proxy web:3000
-  }
+	handle {
+		reverse_proxy web:3000
+	}
 }

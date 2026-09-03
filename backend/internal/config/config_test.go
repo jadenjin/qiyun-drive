@@ -65,6 +65,18 @@ func TestValidateAcceptsLocalHTTPConfiguration(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInsecurePublicObjectStorage(t *testing.T) {
+	cfg := validConfig()
+	cfg.S3PublicEndpoint = "http://objects.example.com"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("public object storage over cleartext internet HTTP must be rejected")
+	}
+	cfg.S3PublicEndpoint = "http://192.168.1.19:9100"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("private-network object storage should remain supported: %v", err)
+	}
+}
+
 func TestValidateAcceptsPrivateNetworkHTTPConfiguration(t *testing.T) {
 	cfg := validConfig()
 	cfg.PublicBaseURL = "http://192.168.1.3"

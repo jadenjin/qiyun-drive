@@ -37,3 +37,16 @@ func TestPhotoLibrarySeparationMigrationIsEmbedded(t *testing.T) {
 		}
 	}
 }
+
+func TestPurgeClaimMigrationIsEmbedded(t *testing.T) {
+	body, err := migrations.ReadFile("migrations/004_purge_claims.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, marker := range []string{"ADD COLUMN purge_job_id", "REFERENCES jobs(id)", "DEFERRABLE INITIALLY DEFERRED", "nodes_purge_job_idx"} {
+		if !strings.Contains(text, marker) {
+			t.Fatalf("missing purge claim marker %s", marker)
+		}
+	}
+}
