@@ -278,6 +278,24 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(48, 130, 99,
 /* Large timelines stay cheap until their date group approaches the viewport. */
 .photo-group { content-visibility: auto; contain-intrinsic-size: 520px; }
 
+.operations-panel { margin-bottom: 24px; padding: 24px; min-width: 0; }
+.operations-panel h2 { margin: 0 0 8px; }
+.operations-panel h3 { margin: 24px 0 12px; font-size: 15px; }
+.operations-panel > p { color: var(--muted); font-size: 13px; }
+.ops-summary { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,220px),1fr)); gap: 12px; }
+.ops-summary article { display: grid; gap: 8px; padding: 16px; background: #f4f7f4; border-radius: 12px; min-width: 0; }
+.ops-summary span { font-size: 15px; overflow-wrap: anywhere; }
+.ops-summary small,.ops-failures small { color: #61736b; font-size: 12px; }
+.operations-panel .ops-warning { background: #fff2da; color: #794f12; border-radius: 10px; padding: 12px; }
+.ops-summary progress { width: 100%; height: 7px; accent-color: #53745e; }
+.ops-services,.ops-failures { list-style: none; padding: 0; display: grid; gap: 8px; }
+.ops-services { grid-template-columns: repeat(auto-fit,minmax(130px,1fr)); }
+.ops-services li { display: flex; justify-content: space-between; gap: 10px; padding: 10px; font-size: 12px; border: 1px solid #e2e8e2; border-radius: 8px; }
+.ops-failures li { display: grid; gap: 6px; padding: 12px; background: #f8f5ef; border-radius: 8px; font-size: 13px; overflow-wrap: anywhere; }
+.operations-panel table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.operations-panel th,.operations-panel td { text-align: left; padding: 10px 5px; border-bottom: 1px solid #e2e8e2; overflow-wrap: anywhere; }
+@media (max-width: 760px) { .operations-panel { padding: 16px; } }
+
 @media (max-width: 780px) {
   .heading-actions { max-width: 220px; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
   .heading-actions .secondary-button,
@@ -295,3 +313,14 @@ button:focus-visible, input:focus-visible { outline: 3px solid rgba(48, 130, 99,
   .heading-actions > button { width: 40px; padding: 0; overflow: hidden; font-size: 0; }
   .heading-actions > button svg { flex: 0 0 auto; }
 }
+
+.photo-timeline-viewport { height: min(68vh, 760px); min-height: 280px; overflow: auto; position: relative; overscroll-behavior: contain; padding-right: 8px; }
+@media (max-width: 700px) { .photo-timeline-viewport { height: calc(100dvh - 340px); } }
+.two-factor-panel { padding: 18px 0; border-top: 1px solid var(--line); }
+.two-factor-panel h3 { font-size: 14px; margin: 14px 0 8px; }
+.two-factor-panel p { font-size: 12px; line-height: 1.6; color: var(--muted); }
+.two-factor-panel form { display: grid; gap: 12px; }
+.recovery-codes pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #edf3ee; border-radius: 8px; }
+.security-event-list { list-style: none; padding: 0; max-height: 220px; overflow: auto; }
+.security-event-list li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.security-event-list strong, .security-event-list small, .security-event-list time { display: block; font-size: 11px; margin: 3px 0; overflow-wrap: anywhere; }

@@ -52,8 +52,11 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { PhotoTimeline } from "./photo-timeline";
+import { AccountSecurity } from "./account-security";
+import { OperationsPanel } from "./operations-panel";
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, clearAllResumeState, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, type UploadSection, type UploadTask } from "./upload-client";
+import { api, clearAllResumeState, clearResumeState, createFolderBatch, loadResumableUploads, resumeMultipartUpload, uploadFile, NeedsFileError, type UploadSection, type UploadTask } from "./upload-client";
 
 function navigateToDownload(url: string) {
   const link = document.createElement("a");
@@ -71,7 +74,7 @@ type Album = { id: string; name: string; description: string; itemCount: number;
 type Member = { id: string; username: string; displayName: string; role: string; createdAt: string };
 type CurrentUser = { id: string; username: string; displayName: string; role: string; householdId: string };
 type ShareItem = { id: string; resourceType: string; resourceId: string; resourceName: string; hasPassword: boolean; allowDownload: boolean; expiresAt?: string; revokedAt?: string; createdAt: string; creatorName?: string; own?: boolean };
-type SessionItem = { id: string; current: boolean; createdAt: string; lastSeenAt: string; expiresAt: string };
+type SessionItem = { id: string; current: boolean; createdAt: string; lastSeenAt: string; expiresAt: string; device?: string; sourceIp?: string; sourceLabel?: string };
 type CreatedActionLink = { title: string; description: string; url: string };
 
 function clientUUID() {
@@ -168,6 +171,9 @@ export function CloudDrive() {
   const [spaceId, setSpaceId] = useState("personal");
   const [nodes, setNodes] = useState<NodeItem[]>(previewNodes);
   const [photos, setPhotos] = useState<PhotoItem[]>(previewPhotos);
+	const [photoCursor, setPhotoCursor] = useState("");
+	const [photosLoading, setPhotosLoading] = useState(false);
+	const photoPageController = useRef<AbortController | null>(null);
   const [albums, setAlbums] = useState<Album[]>(previewAlbums);
   const [selectedAlbum, setSelectedAlbum] = useState<Album | null>(null);
   const [albumPhotos, setAlbumPhotos] = useState<PhotoItem[]>([]);
@@ -205,7 +211,8 @@ export function CloudDrive() {
   const [toast, setToast] = useState("");
   const [uploads, setUploads] = useState<UploadTask[]>([]);
   const [setupForm, setSetupForm] = useState({ householdName: "我们的家", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Shanghai", username: "", displayName: "", password: "" });
-  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
+  const [loginForm, setLoginForm] = useState({ username: "", password: "", code: "" });
+	const uploadEpoch=useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
@@ -263,6 +270,8 @@ export function CloudDrive() {
   const refreshView = useCallback(async () => {
     if (status !== "ready" || !spaceId) return;
     refreshController.current?.abort();
+	photoPageController.current?.abort();
+	setPhotosLoading(false);
     const controller = new AbortController();
     refreshController.current = controller;
     const request = <T,>(path: string) => api<T>(path, { signal: controller.signal });
@@ -271,8 +280,9 @@ export function CloudDrive() {
         const result = await request<{ items: NodeItem[] }>(`/nodes?spaceId=${spaceId}${currentParent ? `&parentId=${currentParent}` : ""}`);
         if (!controller.signal.aborted) setNodes(result.items);
       } else if (view === "photos") {
-        const result = await request<{ items: PhotoItem[] }>(`/photos?spaceId=${spaceId}`);
-        if (!controller.signal.aborted) setPhotos(result.items);
+		setPhotoCursor("");
+        const result = await request<{ items: PhotoItem[]; nextCursor: string }>(`/photos?spaceId=${spaceId}`);
+        if (!controller.signal.aborted) { setPhotos(result.items); setPhotoCursor(result.nextCursor); }
       } else if (view === "albums") {
         const result = await request<{ items: Album[] }>(`/albums?spaceId=${spaceId}`);
         if (!controller.signal.aborted) setAlbums(result.items);
@@ -297,6 +307,26 @@ export function CloudDrive() {
       if (refreshController.current === controller) refreshController.current = null;
     }
   }, [currentParent, currentUser?.role, spaceId, status, view]);
+
+	const loadMorePhotos = async () => {
+		if (!photoCursor || photosLoading || status !== "ready") return;
+		const controller = new AbortController();
+		photoPageController.current = controller;
+		setPhotosLoading(true);
+		try {
+			const result = await api<{ items: PhotoItem[]; nextCursor: string }>(`/photos?spaceId=${spaceId}&cursor=${encodeURIComponent(photoCursor)}`, { signal: controller.signal });
+			if (!controller.signal.aborted) {
+				setPhotos(items => { const ids = new Set(items.map(item => item.nodeId)); return [...items, ...result.items.filter(item => !ids.has(item.nodeId))]; });
+				setPhotoCursor(result.nextCursor);
+			}
+		} catch (error) {
+			if (!controller.signal.aborted) showToast(error instanceof Error ? error.message : "照片加载失败");
+		} finally {
+			if (photoPageController.current === controller) { photoPageController.current = null; setPhotosLoading(false); }
+		}
+	};
+
+	useEffect(() => () => { photoPageController.current?.abort(); }, [spaceId, view, currentUser?.id, status]);
 
   useEffect(() => { refreshView(); }, [refreshView]);
 
@@ -372,17 +402,20 @@ export function CloudDrive() {
   useEffect(() => {
     if (status !== "ready" || !currentUser || resumeAttempted.current) return;
     resumeAttempted.current = true;
+	const epoch=uploadEpoch.current;
     (async () => {
       const pending = await loadResumableUploads(currentUser.id);
-      if (!pending.length) return;
-      const tasks: UploadTask[] = pending.map((item) => ({ id: item.key, name: item.file.name, relativePath: item.file.webkitRelativePath || item.file.name, size: item.file.size, progress: 0, state: "uploading" }));
+      if (!pending.length || epoch!==uploadEpoch.current) return;
+      const tasks: UploadTask[] = pending.map((item) => ({ id: item.key, name: item.metadata.name, relativePath: item.metadata.relativePath, size: item.metadata.size, progress: 0, state: "uploading" }));
       setUploads((current) => [...tasks, ...current]);
-      await Promise.all(pending.map(async (item) => {
+	  for(let offset=0;offset<pending.length;offset+=3){
+	  if(epoch!==uploadEpoch.current)break;
+      await Promise.all(pending.slice(offset,offset+3).map(async (item) => {
         const controller = new AbortController();
         uploadControllers.current.set(item.key, controller);
         try {
-          const nodeId = await resumeMultipartUpload(item, controller.signal, (progress) => setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress } : task)));
-          if (item.albumId && nodeId) {
+          const nodeId = await resumeMultipartUpload(item, controller.signal, (progress) => setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress } : task)),(state)=>setUploads(items=>items.map(task=>task.id===item.key?{...task,state}:task)));
+          if (item.albumId && nodeId && epoch===uploadEpoch.current) {
             try {
               await api(`/albums/${item.albumId}/items`, { method: "POST", body: JSON.stringify({ nodeIds: [nodeId] }) });
             } catch {
@@ -392,15 +425,22 @@ export function CloudDrive() {
           setUploads((items) => items.map((task) => task.id === item.key ? { ...task, progress: 1, state: "ready" } : task));
         } catch (error) {
           const message = error instanceof Error ? error.message : "恢复上传失败";
-          setUploads((items) => items.map((task) => task.id === item.key ? { ...task, state: "failed", error: message } : task));
+          setUploads((items) => items.map((task) => task.id === item.key ? { ...task, state: error instanceof NeedsFileError?"needs_file":"failed", error: message } : task));
           if (/过期|不存在/.test(message)) await clearResumeState(item.key);
         } finally {
           uploadControllers.current.delete(item.key);
         }
       }));
-      await refreshView();
+	  }
+      if(epoch===uploadEpoch.current)await refreshView();
     })();
   }, [currentUser, refreshView, status]);
+
+	useEffect(()=>()=>{
+		uploadEpoch.current++;
+		uploadControllers.current.forEach(controller=>controller.abort());
+		uploadControllers.current.clear();
+	},[currentUser?.id]);
 
   const showToast = (message: string) => {
     setToast(message);
@@ -440,6 +480,7 @@ export function CloudDrive() {
   };
 
   const logout = async () => {
+	uploadEpoch.current++;
     uploadControllers.current.forEach((controller) => controller.abort());
     uploadControllers.current.clear();
     await clearAllResumeState();
@@ -563,9 +604,10 @@ export function CloudDrive() {
     const tasks = selected.map((file) => ({ id: clientUUID(), name: file.name, relativePath: file.webkitRelativePath || file.name, size: file.size, progress: 0, state: "queued" as const }));
     setUploads((current) => [...tasks, ...current]);
     const queue = [...selected.entries()];
+	const epoch=uploadEpoch.current;
     const uploadedNodeIds: string[] = [];
     const worker = async () => {
-      while (queue.length) {
+      while (queue.length && epoch===uploadEpoch.current) {
         const next = queue.shift();
         if (!next) return;
         const [index, file] = next;
@@ -574,7 +616,7 @@ export function CloudDrive() {
         uploadControllers.current.set(task.id, controller);
         setUploads((items) => items.map((item) => item.id === task.id ? { ...item, state: "uploading" } : item));
         try {
-          const nodeId = await uploadFile(file, { spaceId, parentId: section === "photos" ? null : currentParent, batchId, albumId, section, ownerUserId: currentUser.id, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)) });
+          const nodeId = await uploadFile(file, { spaceId, parentId: section === "photos" ? null : currentParent, batchId, albumId, section, ownerUserId: currentUser.id, resumeKey: task.id, signal: controller.signal, onProgress: (progress) => setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress } : item)), onPhase:(state)=>setUploads(items=>items.map(item=>item.id===task.id?{...item,state}:item)) });
           uploadedNodeIds.push(nodeId);
           setUploads((items) => items.map((item) => item.id === task.id ? { ...item, progress: 1, state: "ready" } : item));
         } catch (error) {
@@ -586,6 +628,7 @@ export function CloudDrive() {
       }
     };
     await Promise.all(Array.from({ length: Math.min(3, selected.length) }, worker));
+	if(epoch!==uploadEpoch.current)return;
     if (albumId && uploadedNodeIds.length) {
       const result = await api<{ added: number }>(`/albums/${albumId}/items`, { method: "POST", body: JSON.stringify({ nodeIds: uploadedNodeIds }) });
       showToast(`已上传并加入相册：${result.added} 张照片`);
@@ -683,11 +726,19 @@ export function CloudDrive() {
     const pending = await loadResumableUploads(currentUser.id);
     const resumable = pending.find((item) => item.key === taskId || taskId.includes(item.session.id));
     if (!resumable) { showToast("上传会话已失效，请重新选择文件"); return; }
+    let selectedFile: File | undefined;
+    if(!resumable.file&&resumable.phase!=="confirming") {
+      selectedFile=await new Promise<File|undefined>(resolve=>{
+        const input=document.createElement("input");input.type="file";
+        input.onchange=()=>resolve(input.files?.[0]);input.oncancel=()=>resolve(undefined);input.click();
+      });
+      if(!selectedFile)return;
+    }
     const controller = new AbortController();
     uploadControllers.current.set(taskId, controller);
     setUploads((items) => items.map((item) => item.id === taskId ? { ...item, state: "uploading", error: undefined } : item));
     try {
-      const nodeId = await resumeMultipartUpload(resumable, controller.signal, (progress) => setUploads((items) => items.map((item) => item.id === taskId ? { ...item, progress } : item)));
+      const nodeId = await resumeMultipartUpload(resumable, controller.signal, (progress) => setUploads((items) => items.map((item) => item.id === taskId ? { ...item, progress } : item)),(state)=>setUploads(items=>items.map(item=>item.id===taskId?{...item,state}:item)),selectedFile);
       if (resumable.albumId && nodeId) {
         try {
           await api(`/albums/${resumable.albumId}/items`, { method: "POST", body: JSON.stringify({ nodeIds: [nodeId] }) });
@@ -700,7 +751,7 @@ export function CloudDrive() {
       await refreshView();
     } catch (error) {
       const paused = error instanceof DOMException && error.name === "AbortError";
-      setUploads((items) => items.map((item) => item.id === taskId ? { ...item, state: paused ? "paused" : "failed", error: paused ? undefined : error instanceof Error ? error.message : "恢复失败" } : item));
+      setUploads((items) => items.map((item) => item.id === taskId ? { ...item, state: error instanceof NeedsFileError?"needs_file":paused ? "paused" : "failed", error: paused ? undefined : error instanceof Error ? error.message : "恢复失败" } : item));
     } finally { uploadControllers.current.delete(taskId); }
   };
 
@@ -958,11 +1009,11 @@ export function CloudDrive() {
           <input ref={photoInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handlePhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           <input ref={albumInput} type="file" multiple accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,.heic,.heif" hidden onChange={(event) => { void handleAlbumPhotos(Array.from(event.target.files || [])); event.currentTarget.value = ""; }} />
           {view === "files" && <FileView items={nodes} grid={grid} onGrid={setGrid} breadcrumbs={breadcrumbs} onBreadcrumb={goBreadcrumb} onOpen={(item) => void openNode(item)} onDownload={downloadNode} onRename={setNodeEditor} onMove={(items) => void openMoveEditor(items)} onTrash={trashNode} onBatchTrash={(items) => void trashNodeBatch(items)} onPermissions={(item) => void openPermissionEditor("node", item.id, item.name)} canManagePermissions={selectedSpace?.kind === "family" && selectedSpace.permission === "manager"} onShare={(item) => setShareTarget({ id: item.id, kind: item.kind, name: item.name })} onUploadFolder={() => folderInput.current?.click()} />}
-          {view === "photos" && <PhotoView photos={photos} onOpen={(photo) => setPhotoViewer({ photo })} />}
+          {view === "photos" && <><PhotoView photos={photos} onOpen={(photo) => setPhotoViewer({ photo })} />{photoCursor && <button className="secondary-button" disabled={photosLoading} onClick={() => void loadMorePhotos()}>{photosLoading ? "正在加载…" : "加载更早的照片"}</button>}</>}
           {view === "albums" && (selectedAlbum ? <AlbumDetail album={selectedAlbum} photos={albumPhotos} onBack={() => { setSelectedAlbum(null); setAlbumPhotos([]); }} onUpload={chooseAlbumPhotos} onOpen={(photo) => setPhotoViewer({ photo, albumId: selectedAlbum.id })} onEdit={setAlbumEditor} onPermissions={selectedSpace?.kind === "family" && selectedAlbum.permission === "manager" ? (album) => void openPermissionEditor("album", album.id, album.name) : undefined} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} onDelete={deleteAlbum} /> : <AlbumView albums={albums} onOpen={openAlbum} onUpload={chooseAlbumPhotos} onShare={(album) => setShareTarget({ id: album.id, kind: "album", name: album.name })} />)}
           {view === "shares" && <ShareView shares={status === "preview" ? undefined : shares} onRevoke={revokeShare} />}
           {view === "trash" && <TrashView nodes={status === "preview" ? previewNodes.slice(3, 5).map((item) => ({ ...item, deletedAt: new Date(Date.now() - 3 * 86400000).toISOString(), purgeAt: new Date(Date.now() + 27 * 86400000).toISOString() })) : trashNodes} onRestore={restoreTrashNode} onPurge={purgeTrashNode} onEmpty={emptyTrash} />}
-          {view === "family" && <FamilyView members={members} auditItems={auditItems} space={spaces.find((item) => item.kind === "family") || selectedSpace} canManage={currentUser?.role === "owner" || currentUser?.role === "admin"} canEditRoles={currentUser?.role === "owner"} canEditQuota={currentUser?.role === "owner"} canResetMember={(member) => currentUser?.role === "owner" || member.role === "member"} onResetPassword={createMemberPasswordReset} onRoleChange={updateMemberRole} onPermissionGuide={() => setPermissionGuideOpen(true)} onEditQuota={(space) => setQuotaEditor(space)} />}
+          {view === "family" && currentUser?.role === "owner" && <OperationsPanel />}{view === "family" && <FamilyView members={members} auditItems={auditItems} space={spaces.find((item) => item.kind === "family") || selectedSpace} canManage={currentUser?.role === "owner" || currentUser?.role === "admin"} canEditRoles={currentUser?.role === "owner"} canEditQuota={currentUser?.role === "owner"} canResetMember={(member) => currentUser?.role === "owner" || member.role === "member"} onResetPassword={createMemberPasswordReset} onRoleChange={updateMemberRole} onPermissionGuide={() => setPermissionGuideOpen(true)} onEditQuota={(space) => setQuotaEditor(space)} />}
         </div>
       </main>
       <div className="mobile-nav">{navItems.slice(0, 4).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => changeView(item.id)}><item.icon size={20} /><span>{item.label}</span></button>)}</div>
@@ -977,7 +1028,7 @@ export function CloudDrive() {
       {nodeEditor && <RenameDialog item={nodeEditor} onClose={() => setNodeEditor(null)} onSubmit={(name) => renameNode(nodeEditor, name)} />}
       {moveEditor && <MoveDialog items={moveEditor.items} folders={moveEditor.folders} rootName={selectedSpace?.name || "空间根目录"} onClose={() => setMoveEditor(null)} onSubmit={(parentId) => moveNodes(moveEditor.items, parentId)} />}
       {permissionEditor && <PermissionDialog value={permissionEditor} members={members} currentUserId={currentUser?.id} onClose={() => setPermissionEditor(null)} onSubmit={savePermissions} />}
-      {accountDialogOpen && currentUser && <AccountDialog user={currentUser} sessions={sessions} sessionsLoading={sessionsLoading} onClose={() => setAccountDialogOpen(false)} onProfile={updateProfile} onPassword={changeOwnPassword} onRevokeSession={revokeOwnSession} />}
+      {accountDialogOpen && currentUser && <AccountDialog user={currentUser} sessions={sessions} sessionsLoading={sessionsLoading} onClose={() => setAccountDialogOpen(false)} onProfile={updateProfile} onPassword={changeOwnPassword} onRevokeSession={revokeOwnSession} onRefreshSessions={() => void openAccountSettings()} />}
       {permissionGuideOpen && <PermissionGuideDialog onClose={() => setPermissionGuideOpen(false)} />}
       {quotaEditor && <QuotaDialog space={quotaEditor} onClose={() => setQuotaEditor(null)} onSubmit={(quotaBytes) => updateSpaceQuota(quotaEditor, quotaBytes)} />}
       {toast && <div className="toast" role="status" aria-live="polite"><ShieldCheck size={18} />{toast}</div>}
@@ -1012,19 +1063,7 @@ function FileView({ items, grid, onGrid, breadcrumbs, onBreadcrumb, onOpen, onDo
 }
 
 function PhotoView({ photos, onOpen }: { photos: PhotoItem[]; onOpen: (photo: PhotoItem) => void }) {
-  const groups = useMemo(() => {
-    const result = new Map<string, { label: string; items: PhotoItem[] }>();
-    [...photos].sort((left, right) => new Date(right.takenAt || right.createdAt).getTime() - new Date(left.takenAt || left.createdAt).getTime()).forEach((photo) => {
-      const date = new Date(photo.takenAt || photo.createdAt);
-      const key = Number.isNaN(date.getTime()) ? "unknown" : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-      const label = Number.isNaN(date.getTime()) ? "未知日期" : new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" }).format(date);
-      const group = result.get(key) || { label, items: [] };
-      group.items.push(photo);
-      result.set(key, group);
-    });
-    return Array.from(result.entries());
-  }, [photos]);
-  return <div className="photo-view"><div className="photo-summary"><span className="summary-icon"><Camera size={21} /></span><span><strong>{photos.length || 0} 张照片</strong><small>来自照片页与相册，按拍摄时间自动整理</small></span></div>{groups.map(([key, group]) => <section className="photo-group" key={key}><div className="photo-date"><h2>{group.label}</h2><span>{group.items.length} 张</span></div><div className="photo-grid">{group.items.map((photo, index) => <button type="button" className={`photo-card photo-${photo.tone || "default"} ${index % 5 === 0 ? "tall" : ""}`} key={photo.nodeId} onClick={() => onOpen(photo)}>{photo.thumbUrl ? <img src={photo.thumbUrl} alt={photo.remark || photo.name} loading="lazy" decoding="async" /> : <div className="photo-art"><span>{photo.tone === "mountain" ? "山野" : photo.tone === "sunset" ? "日落" : photo.tone === "forest" ? "林间" : photo.tone === "city" ? "夜色" : photo.tone === "flower" ? "花期" : "日常"}</span></div>}<div className="photo-overlay"><strong>{photo.remark || photo.name}</strong><small>{photo.name}</small></div></button>)}</div></section>)}{!photos.length && <EmptyState icon={Images} title="还没有照片" text="从照片页或相册上传后，这里会按拍摄日期自动生成时间线" />}</div>;
+  return <PhotoTimeline photos={photos} onOpen={onOpen} />;
 }
 
 function AlbumView({ albums, onOpen, onUpload, onShare }: { albums: Album[]; onOpen: (album: Album) => void; onUpload: (album: Album) => void; onShare: (album: Album) => void }) {
@@ -1037,7 +1076,7 @@ function AlbumDetail({ album, photos, onBack, onUpload, onOpen, onEdit, onPermis
 
 function ShareView({ shares: actualShares, onRevoke }: { shares?: ShareItem[]; onRevoke: (id: string) => void }) {
   const preview = [{ id: "preview-1", resourceName: "川西 · 2026", resourceType: "album", expiresAt: "2026-08-16T12:00:00Z", hasPassword: true, revokedAt: undefined }, { id: "preview-2", resourceName: "2026 家庭旅行计划.pdf", resourceType: "file", expiresAt: undefined, hasPassword: true, revokedAt: undefined }, { id: "preview-3", resourceName: "家庭资料", resourceType: "folder", expiresAt: "2026-08-12T12:00:00Z", hasPassword: false, revokedAt: undefined }];
-  const items = actualShares || preview;
+  const items: Omit<ShareItem, "resourceId" | "allowDownload" | "createdAt">[] = actualShares || preview;
   const [tab, setTab] = useState<"active" | "history">("active");
   const [referenceTime] = useState(() => Date.now());
   const active = items.filter((share) => !share.revokedAt && (!share.expiresAt || new Date(share.expiresAt).getTime() > referenceTime));
@@ -1090,7 +1129,7 @@ function FamilyView({ members, auditItems, space, canManage, canEditRoles, canEd
 
 function UploadTray({ tasks, onClose, onPause, onResume }: { tasks: UploadTask[]; onClose: () => void; onPause: (id: string) => void; onResume: (id: string) => void }) {
   const done = tasks.filter((item) => item.state === "ready").length;
-  return <aside className="upload-tray"><div className="upload-title"><span><UploadCloud size={18} /> 上传任务 <small>{done}/{tasks.length}</small></span><button onClick={onClose} disabled={!done} aria-label="清除已完成上传" title={done ? "清除已完成" : "上传完成后可清除"}><X size={17} /></button></div><div className="upload-items">{tasks.slice(0, 8).map((task) => <div className="upload-item" key={task.id}><span className="file-icon"><File size={16} /></span><span><strong>{task.name}</strong><small>{task.state === "ready" ? "上传完成" : task.state === "failed" ? task.error : task.state === "paused" ? "已暂停，可继续上传" : `${Math.round(task.progress * 100)}% · ${formatBytes(task.size)}`}</small><span className={`upload-progress ${task.state}`}><i style={{ width: `${task.progress * 100}%` }} /></span></span>{task.state === "uploading" && <button className="upload-control" onClick={() => onPause(task.id)} aria-label="暂停上传"><Pause size={15} /></button>}{(task.state === "paused" || task.state === "failed") && <button className="upload-control" onClick={() => onResume(task.id)} aria-label={task.state === "failed" ? "重试上传" : "继续上传"}><Play size={15} /></button>}</div>)}</div></aside>;
+  return <aside className="upload-tray"><div className="upload-title"><span><UploadCloud size={18} /> 上传任务 <small>{done}/{tasks.length}</small></span><button onClick={onClose} disabled={!done} aria-label="清除已完成上传" title={done ? "清除已完成" : "上传完成后可清除"}><X size={17} /></button></div><div className="upload-items">{tasks.slice(0, 8).map((task) => <div className="upload-item" key={task.id}><span className="file-icon"><File size={16} /></span><span><strong>{task.name}</strong><small>{task.state === "ready" ? "上传完成" : task.state === "failed" ? task.error : task.state === "paused" ? "已暂停，可继续上传" : task.state === "checking" ? "正在校验文件内容" : task.state === "confirming" ? "文件已传输，等待后台确认" : task.state === "needs_file" ? "请重新选择原文件，已上传分片保留" : `${Math.round(task.progress * 100)}% · ${formatBytes(task.size)}`}</small><span className={`upload-progress ${task.state}`}><i style={{ width: `${task.progress * 100}%` }} /></span></span>{["uploading","checking","confirming"].includes(task.state) && <button className="upload-control" onClick={() => onPause(task.id)} aria-label="暂停上传"><Pause size={15} /></button>}{(task.state === "paused" || task.state === "failed" || task.state === "needs_file") && <button className="upload-control" onClick={() => onResume(task.id)} aria-label={task.state === "needs_file" ? "重新选择原文件" : task.state === "failed" ? "重试上传" : "继续上传"}><Play size={15} /></button>}</div>)}</div></aside>;
 }
 
 function PhotoViewer({ photo, onClose, onSave, onDownload, onRemove }: { photo: PhotoItem; onClose: () => void; onSave: (remark: string) => void; onDownload: () => void; onRemove?: () => void }) {
@@ -1159,7 +1198,7 @@ function PermissionDialog({ value, members, currentUserId, onClose, onSubmit }: 
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal permission-editor" onSubmit={(event) => { event.preventDefault(); onSubmit(draft); }}><div className="modal-icon"><ShieldCheck size={22} /></div><h2>设置「{value.name}」权限</h2><p>所有者和管理员始终拥有管理权限；可为普通家庭成员单独指定访问级别。</p><label className="checkbox-label permission-inherit"><input type="checkbox" checked={draft.inherit} onChange={(event) => setDraft((current) => ({ ...current, inherit: event.target.checked }))} />未单独设置的成员继承上级目录权限</label><div className="permission-members">{editableMembers.map((member) => <label key={member.id}><span className="member-avatar">{member.displayName.slice(0, 1)}</span><span><strong>{member.displayName}</strong><small>@{member.username}</small></span><select value={permissionFor(member.id)} onChange={(event) => setPermission(member, event.target.value as PermissionEntry["permission"])}><option value="none">不单独设置</option><option value="viewer">查看者</option><option value="editor">编辑者</option><option value="manager">管理者</option></select></label>)}{!editableMembers.length && <p className="permission-empty">暂无可单独配置的普通家庭成员。</p>}</div><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存权限</button></div></form></div>;
 }
 
-function AccountDialog({ user, sessions, sessionsLoading, onClose, onProfile, onPassword, onRevokeSession }: { user: CurrentUser; sessions: SessionItem[]; sessionsLoading: boolean; onClose: () => void; onProfile: (displayName: string) => void; onPassword: (currentPassword: string, newPassword: string) => void; onRevokeSession: (session: SessionItem) => void }) {
+function AccountDialog({ user, sessions, sessionsLoading, onClose, onProfile, onPassword, onRevokeSession, onRefreshSessions }: { onRefreshSessions: () => void; user: CurrentUser; sessions: SessionItem[]; sessionsLoading: boolean; onClose: () => void; onProfile: (displayName: string) => void; onPassword: (currentPassword: string, newPassword: string) => void; onRevokeSession: (session: SessionItem) => void }) {
   const [tab, setTab] = useState<"profile" | "security">("profile");
   const [displayName, setDisplayName] = useState(user.displayName);
   const [passwords, setPasswords] = useState({ current: "", next: "", confirm: "" });
@@ -1171,11 +1210,11 @@ function AccountDialog({ user, sessions, sessionsLoading, onClose, onProfile, on
     setError("");
     onPassword(passwords.current, passwords.next);
   };
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal account-dialog" role="dialog" aria-modal="true" aria-label="账户设置"><div className="modal-icon">{tab === "profile" ? <UserRound size={22} /> : <KeyRound size={22} />}</div><h2>账户设置</h2><div className="account-tabs"><button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>个人资料</button><button className={tab === "security" ? "active" : ""} onClick={() => setTab("security")}>登录安全</button></div>{tab === "profile" ? <form onSubmit={(event) => { event.preventDefault(); if (displayName.trim()) onProfile(displayName.trim()); }}><label className="modal-label">用户名<input value={user.username} disabled /></label><label className="modal-label">显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={100} /></label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存资料</button></div></form> : <div className="account-security"><form onSubmit={submitPassword}><label className="modal-label">当前密码<input type="password" value={passwords.current} onChange={(event) => setPasswords({ ...passwords, current: event.target.value })} autoComplete="current-password" /></label><label className="modal-label">新密码<input type="password" value={passwords.next} onChange={(event) => setPasswords({ ...passwords, next: event.target.value })} autoComplete="new-password" placeholder="至少 10 个字符" /></label><label className="modal-label">确认新密码<input type="password" value={passwords.confirm} onChange={(event) => setPasswords({ ...passwords, confirm: event.target.value })} autoComplete="new-password" /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">更新密码</button></div></form><section className="session-list" aria-label="登录设备"><div><strong>登录设备</strong><small>发现陌生会话时可立即退出</small></div>{sessionsLoading ? <p>正在加载…</p> : sessions.map((session) => <article key={session.id}><span><ShieldCheck size={17} /></span><span><strong>{session.current ? "当前设备" : `活跃于 ${relativeDate(session.lastSeenAt)}`}</strong><small>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(session.createdAt))} 登录</small></span>{session.current ? <em>当前</em> : <button type="button" onClick={() => onRevokeSession(session)}>退出</button>}</article>)}{!sessionsLoading && !sessions.length && <p>暂无有效登录会话</p>}</section></div>}</section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal account-dialog" role="dialog" aria-modal="true" aria-label="账户设置"><div className="modal-icon">{tab === "profile" ? <UserRound size={22} /> : <KeyRound size={22} />}</div><h2>账户设置</h2><div className="account-tabs"><button className={tab === "profile" ? "active" : ""} onClick={() => setTab("profile")}>个人资料</button><button className={tab === "security" ? "active" : ""} onClick={() => setTab("security")}>登录安全</button></div>{tab === "profile" ? <form onSubmit={(event) => { event.preventDefault(); if (displayName.trim()) onProfile(displayName.trim()); }}><label className="modal-label">用户名<input value={user.username} disabled /></label><label className="modal-label">显示名称<input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={100} /></label><div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">保存资料</button></div></form> : <div className="account-security"><form onSubmit={submitPassword}><label className="modal-label">当前密码<input type="password" value={passwords.current} onChange={(event) => setPasswords({ ...passwords, current: event.target.value })} autoComplete="current-password" /></label><label className="modal-label">新密码<input type="password" value={passwords.next} onChange={(event) => setPasswords({ ...passwords, next: event.target.value })} autoComplete="new-password" placeholder="至少 10 个字符" /></label><label className="modal-label">确认新密码<input type="password" value={passwords.confirm} onChange={(event) => setPasswords({ ...passwords, confirm: event.target.value })} autoComplete="new-password" /></label>{error && <p className="form-error">{error}</p>}<div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button type="submit" className="primary-button">更新密码</button></div></form><AccountSecurity onSessionsChanged={onRefreshSessions} /><section className="session-list" aria-label="登录设备"><div><strong>登录设备</strong><small>发现陌生会话时可立即退出</small></div>{sessionsLoading ? <p>正在加载…</p> : sessions.map((session) => <article key={session.id}><span><ShieldCheck size={17} /></span><span><strong>{session.current ? "当前设备" : `活跃于 ${relativeDate(session.lastSeenAt)}`}</strong><small>{session.device || "未知设备"} · {session.sourceLabel || "来源未知"} {session.sourceIp}</small><small>{new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(session.createdAt))} 登录</small></span>{session.current ? <em>当前</em> : <button type="button" onClick={() => onRevokeSession(session)}>退出</button>}</article>)}{!sessionsLoading && !sessions.length && <p>暂无有效登录会话</p>}</section></div>}</section></div>;
 }
 
 function PermissionGuideDialog({ onClose }: { onClose: () => void }) {
-  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal permission-guide" role="dialog" aria-modal="true" aria-label="权限说明"><div className="modal-icon"><ShieldCheck size={22} /></div><h2>权限如何工作</h2><p>个人空间始终只有本人可见；家庭空间可针对文件夹和相册设置权限。</p><div className="permission-levels"><span><strong>查看者</strong><small>浏览与下载内容</small></span><span><strong>编辑者</strong><small>上传、重命名和整理内容</small></span><span><strong>管理者</strong><small>编辑内容、分享并设置成员权限</small></span></div><div className="modal-actions"><button type="button" onClick={onClose}>关闭</button></div></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="modal permission-guide" role="dialog" aria-modal="true" aria-label="权限说明"><div className="modal-icon"><ShieldCheck size={22} /></div><h2>权限如何工作</h2><p>个人空间始终只有本人可见；家庭空间可针对文件夹和相册设置权限。加入相册会让相册成员看到照片，仅照片管理者或仍有编辑权限的上传者可以添加。添加者失去这些权限后，照片会从相册及其分享中隐藏。</p><div className="permission-levels"><span><strong>查看者</strong><small>浏览与下载内容</small></span><span><strong>编辑者</strong><small>上传、重命名和整理内容</small></span><span><strong>管理者</strong><small>编辑内容、分享并设置成员权限</small></span></div><div className="modal-actions"><button type="button" onClick={onClose}>关闭</button></div></section></div>;
 }
 
 function QuotaDialog({ space, onClose, onSubmit }: { space: Space; onClose: () => void; onSubmit: (quotaBytes: number) => void }) {
@@ -1221,8 +1260,8 @@ function EmptyState({ icon: Icon, title, text }: { icon: typeof Folder; title: s
 
 function LoadingScreen() { return <div className="loading-screen"><span className="loading-cloud"><Cloud size={30} /></span><strong>栖云</strong><small>正在打开你的空间…</small></div>; }
 
-function LoginScreen({ values, onChange, onSubmit, toast }: { values: { username: string; password: string }; onChange: (value: { username: string; password: string }) => void; onSubmit: (event: FormEvent) => void; toast: string }) {
-  return <AuthShell title="欢迎回来" subtitle="回到你的文件与照片"><form onSubmit={onSubmit}><label>用户名<input value={values.username} onChange={(event) => onChange({ ...values, username: event.target.value })} placeholder="输入用户名" /></label><label>密码<input type="password" value={values.password} onChange={(event) => onChange({ ...values, password: event.target.value })} placeholder="输入密码" /></label><button className="auth-submit">进入我的空间 <ChevronRight size={18} /></button>{toast && <p className="auth-error">{toast}</p>}</form><div className="auth-foot"><ShieldCheck size={16} /> 账号与文件均由你自己的服务器保管</div></AuthShell>;
+function LoginScreen({ values, onChange, onSubmit, toast }: { values: { username: string; password: string; code: string }; onChange: (value: { username: string; password: string; code: string }) => void; onSubmit: (event: FormEvent) => void; toast: string }) {
+  return <AuthShell title="欢迎回来" subtitle="回到你的文件与照片"><form onSubmit={onSubmit}><label>用户名<input value={values.username} onChange={(event) => onChange({ ...values, username: event.target.value })} placeholder="输入用户名" /></label><label>密码<input type="password" value={values.password} onChange={(event) => onChange({ ...values, password: event.target.value })} placeholder="输入密码" /></label><label>动态码或恢复码（开启二次验证时填写）<input value={values.code} onChange={(event) => onChange({ ...values, code: event.target.value.trim() })} autoComplete="one-time-code" maxLength={22} /></label><button className="auth-submit">进入我的空间 <ChevronRight size={18} /></button>{toast && <p className="auth-error">{toast}</p>}</form><div className="auth-foot"><ShieldCheck size={16} /> 账号与文件均由你自己的服务器保管</div></AuthShell>;
 }
 
 function SetupScreen({ values, onChange, onSubmit, toast }: { values: { householdName: string; timezone: string; username: string; displayName: string; password: string }; onChange: (value: typeof values) => void; onSubmit: (event: FormEvent) => void; toast: string }) {

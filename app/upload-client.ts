@@ -4,7 +4,7 @@ export type UploadTask = {
   relativePath: string;
   size: number;
   progress: number;
-  state: "queued" | "uploading" | "paused" | "ready" | "failed";
+  state: "queued" | "uploading" | "checking" | "confirming" | "needs_file" | "paused" | "ready" | "failed";
   error?: string;
 };
 
@@ -20,9 +20,17 @@ type UploadSession = {
 };
 
 type Part = { partNumber: number; etag: string };
-export type ResumableUpload = { key: string; ownerUserId: string; session: UploadSession; file: File; parts: Part[]; partSize: number; updatedAt: number; albumId?: string };
+type FileMetadata = { name: string; size: number; lastModified: number; type: string; relativePath: string };
+export type ResumableUpload = { key: string; ownerUserId: string; session: UploadSession; file?: File; metadata: FileMetadata; sha256?: string; phase?: "uploading" | "confirming"; parts: Part[]; partSize: number; updatedAt: number; albumId?: string };
+export class NeedsFileError extends Error { constructor(){super("请重新选择原文件，已上传分片会保留");this.name="NeedsFileError";} }
+const memoryFiles = new Map<string,File>();
+const memoryRecords = new Map<string,ResumableUpload>();
+function fileMetadata(file: File): FileMetadata { return {name:file.name,size:file.size,lastModified:file.lastModified,type:file.type,relativePath:file.webkitRelativePath||file.name}; }
 
 const apiBase = process.env.NEXT_PUBLIC_API_BASE || "/api/v1";
+class ApiError extends Error {
+  constructor(message:string,readonly status:number,readonly code?:string){super(message);this.name="ApiError";}
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
@@ -44,7 +52,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const data = await response.json().catch(() => null);
-    throw new Error(data?.error?.message || `请求失败 (${response.status})`);
+    throw new ApiError(data?.error?.message || `请求失败 (${response.status})`,response.status,data?.error?.code);
   }
   return response.status === 204 ? (undefined as T) : response.json();
 }
@@ -85,7 +93,12 @@ function putBlob(
   });
 }
 
-async function saveResumeState(key: string, value: unknown) {
+async function saveResumeState(key: string, input: Omit<ResumableUpload,"key"|"metadata"> & {metadata?:FileMetadata}) {
+  if(input.file) memoryFiles.set(key,input.file);
+  const metadata=input.metadata || (input.file?fileMetadata(input.file):undefined);
+  if(!metadata) throw new Error("缺少恢复文件信息");
+  const value={...input,file:undefined,metadata};
+  memoryRecords.set(key,{...value,key});
   if (!("indexedDB" in window)) return;
   await new Promise<void>((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
@@ -101,6 +114,7 @@ async function saveResumeState(key: string, value: unknown) {
 }
 
 export async function clearResumeState(key: string) {
+  memoryFiles.delete(key); memoryRecords.delete(key);
   if (!("indexedDB" in window)) return;
   await new Promise<void>((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
@@ -116,6 +130,7 @@ export async function clearResumeState(key: string) {
 }
 
 export async function clearAllResumeState() {
+  memoryFiles.clear();memoryRecords.clear();
   if (!("indexedDB" in window)) return;
   await new Promise<void>((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
@@ -131,25 +146,32 @@ export async function clearAllResumeState() {
 }
 
 export async function loadResumableUploads(ownerUserId: string): Promise<ResumableUpload[]> {
-  if (!("indexedDB" in window)) return [];
+  const inMemory=()=>Array.from(memoryRecords.values()).filter(item=>item.ownerUserId===ownerUserId).map(item=>({...item,file:memoryFiles.get(item.key)}));
+  if (!("indexedDB" in window)) return inMemory();
   return new Promise((resolve) => {
     const request = indexedDB.open("pan-upload-queue", 1);
     request.onupgradeneeded = () => request.result.createObjectStore("uploads");
-    request.onerror = () => resolve([]);
+    request.onerror = () => resolve(inMemory());
     request.onsuccess = () => {
       const results: ResumableUpload[] = [];
-      const tx = request.result.transaction("uploads", "readonly");
+      const tx = request.result.transaction("uploads", "readwrite");
       const cursor = tx.objectStore("uploads").openCursor();
       cursor.onsuccess = () => {
         if (!cursor.result) return;
         const value = cursor.result.value as Partial<ResumableUpload>;
-        if (value.ownerUserId === ownerUserId && value.session && value.file instanceof File) {
-          results.push({ key: String(cursor.result.key), ownerUserId, session: value.session, file: value.file, parts: value.parts || [], partSize: value.partSize || 16 * 1024 * 1024, updatedAt: value.updatedAt || 0, albumId: value.albumId });
+        const key=String(cursor.result.key);
+        const oldFile=value.file instanceof File?value.file:undefined;
+        const metadata=value.metadata || (oldFile?fileMetadata(oldFile):undefined);
+        if(oldFile&&metadata) cursor.result.update({...value,file:undefined,metadata});
+        if (value.ownerUserId === ownerUserId && value.session && metadata) {
+          if(oldFile)memoryFiles.set(key,oldFile);
+          const item={...value,key,ownerUserId,session:value.session,metadata,file:memoryFiles.get(key),parts:value.parts||[],partSize:value.partSize||16*1024*1024,updatedAt:value.updatedAt||0};
+          results.push(item);memoryRecords.set(key,item);
         }
         cursor.result.continue();
       };
-      tx.oncomplete = () => { request.result.close(); resolve(results); };
-      tx.onerror = () => { request.result.close(); resolve([]); };
+      tx.oncomplete = () => { request.result.close(); const keys=new Set(results.map(item=>item.key));resolve([...results,...inMemory().filter(item=>!keys.has(item.key))]); };
+      tx.onerror = () => { request.result.close(); resolve(inMemory()); };
     };
   });
 }
@@ -176,6 +198,45 @@ export async function createFolderBatch(
   return batch.id;
 }
 
+async function waitForPublication(sessionId: string, signal: AbortSignal): Promise<string> {
+  for (;;) {
+    const status = await api<{ state: string; nodeId: string }>(`/uploads/${sessionId}/resume`, { method: "POST", signal });
+    if (status.state === "ready") return status.nodeId;
+    if (status.state !== "completing") throw new Error("文件尚未完成上传，请重试");
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => { window.clearTimeout(timer); reject(new DOMException("Paused", "AbortError")); };
+      const timer = window.setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, 1500);
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+}
+
+function hashFile(file: File, signal: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./hash-worker.ts", import.meta.url), { type: "module" });
+    const finish = () => { worker.terminate(); signal.removeEventListener("abort", abort); };
+    const abort = () => { finish(); reject(new DOMException("Paused", "AbortError")); };
+    worker.onmessage = (event: MessageEvent<{ digest?: string; error?: string }>) => {
+      finish();
+      if (event.data.digest) resolve(event.data.digest);
+      else reject(new Error(event.data.error || "文件校验失败"));
+    };
+    worker.onerror = () => { finish(); reject(new Error("文件校验失败，请重试")); };
+    if (signal.aborted) { abort(); return; }
+    signal.addEventListener("abort", abort, { once: true });
+    worker.postMessage(file);
+  });
+}
+
+async function completeAndWait(sha256: string, sessionId: string, parts: Part[], signal: AbortSignal) {
+  for(let attempt=0;;attempt++) {
+    try {await api(`/uploads/${sessionId}/complete`, { method: "POST", body: JSON.stringify({ parts, sha256 }), signal });break;}
+    catch(error){if(!(error instanceof ApiError)||error.code!=="concurrent_change"||attempt>=2||signal.aborted)throw error;}
+  }
+  return waitForPublication(sessionId, signal);
+}
+
 export async function uploadFile(
   file: File,
   options: {
@@ -188,6 +249,7 @@ export async function uploadFile(
     resumeKey?: string;
     signal: AbortSignal;
     onProgress: (value: number) => void;
+    onPhase?: (value: UploadTask["state"]) => void;
   },
 ) {
   const session = await api<UploadSession>("/uploads", {
@@ -207,10 +269,17 @@ export async function uploadFile(
   });
   const resumeKey = options.resumeKey || `${session.id}:${file.name}:${file.size}:${file.lastModified}`;
   await saveResumeState(resumeKey, { ownerUserId: options.ownerUserId, session, file, parts: [], partSize: session.partSize || 16 * 1024 * 1024, updatedAt: Date.now(), albumId: options.albumId });
+  options.onPhase?.("checking");
+  const sha256=await hashFile(file,options.signal);
+  const snapshot={ownerUserId:options.ownerUserId,session,file,sha256,partSize:session.partSize||16*1024*1024,updatedAt:Date.now(),albumId:options.albumId};
+  await saveResumeState(resumeKey,{...snapshot,parts:[]});
+  options.onPhase?.("uploading");
 
   if (session.method === "put") {
     await putBlob(session.url!, file, file.type, options.signal, (loaded) => options.onProgress(loaded / Math.max(1, file.size)));
-    await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }), signal: options.signal });
+    await saveResumeState(resumeKey,{...snapshot,parts:[],phase:"confirming"});
+    options.onPhase?.("confirming");
+    await completeAndWait(sha256, session.id, [], options.signal);
     await clearResumeState(resumeKey);
     options.onProgress(1);
     return session.nodeId;
@@ -248,11 +317,13 @@ export async function uploadFile(
         }),
       );
       completed.push(...results);
-      await saveResumeState(resumeKey, { ownerUserId: options.ownerUserId, session, file, parts: completed, partSize, updatedAt: Date.now(), albumId: options.albumId });
+      await saveResumeState(resumeKey, { ...snapshot, parts: completed, partSize, updatedAt: Date.now() });
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);
-  await api(`/uploads/${session.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }), signal: options.signal });
+  await saveResumeState(resumeKey,{...snapshot,parts:completed,phase:"confirming"});
+  options.onPhase?.("confirming");
+  await completeAndWait(sha256, session.id, completed, options.signal);
   await clearResumeState(resumeKey);
   options.onProgress(1);
   return session.nodeId;
@@ -262,21 +333,36 @@ export async function resumeMultipartUpload(
   resumable: ResumableUpload,
   signal: AbortSignal,
   onProgress: (value: number) => void,
+  onPhase?: (value: UploadTask["state"]) => void,
+  selectedFile?: File,
 ) {
-  const { session, file, key } = resumable;
-  const refreshed = await api<{ state: "uploading" | "ready"; nodeId: string; method?: "put" | "multipart"; url?: string; partSize?: number }>(`/uploads/${session.id}/resume`, { method: "POST", signal });
-  if (refreshed.state === "ready") {
+  const { session, key } = resumable;
+  const refreshed = await api<{ state: "uploading" | "completing" | "ready"; nodeId: string; method?: "put" | "multipart"; url?: string; partSize?: number }>(`/uploads/${session.id}/resume`, { method: "POST", signal });
+  if (refreshed.state === "completing") {onPhase?.("confirming"); await waitForPublication(session.id, signal);}
+  if (refreshed.state === "ready" || refreshed.state === "completing") {
     await clearResumeState(key);
     onProgress(1);
     return refreshed.nodeId;
   }
   const activeSession = { ...session, method: refreshed.method || session.method, url: refreshed.url || session.url, partSize: refreshed.partSize || session.partSize };
+  if(resumable.phase==="confirming"&&resumable.sha256){
+    onPhase?.("confirming");await completeAndWait(resumable.sha256,session.id,resumable.parts,signal);await clearResumeState(key);onProgress(1);return refreshed.nodeId;
+  }
+  const file=selectedFile||resumable.file||memoryFiles.get(key);
+  if(!file)throw new NeedsFileError();
+  if(file.name!==resumable.metadata.name||file.size!==resumable.metadata.size)throw new Error("所选文件的名称或大小不匹配，请选择原文件");
+  onPhase?.("checking");
+  const sha256=await hashFile(file,signal);
+  if(resumable.sha256&&resumable.sha256!==sha256)throw new Error("所选文件内容已改变，请选择原文件");
+  resumable={...resumable,sha256,file};
+  onPhase?.("uploading");
   const partSize = activeSession.partSize || resumable.partSize;
   await saveResumeState(key, { ...resumable, session: activeSession, partSize, updatedAt: Date.now() });
   if (activeSession.method === "put") {
     if (!activeSession.url) throw new Error("无法刷新上传地址，请重新选择文件");
     await putBlob(activeSession.url, file, file.type, signal, (loaded) => onProgress(loaded / Math.max(1, file.size)));
-    await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: [] }), signal });
+    await saveResumeState(key,{...resumable,parts:[],phase:"confirming"});onPhase?.("confirming");
+    await completeAndWait(sha256, activeSession.id, [], signal);
     await clearResumeState(key);
     onProgress(1);
     return refreshed.nodeId;
@@ -310,7 +396,8 @@ export async function resumeMultipartUpload(
     }
   }
   completed.sort((a, b) => a.partNumber - b.partNumber);
-  await api(`/uploads/${activeSession.id}/complete`, { method: "POST", body: JSON.stringify({ parts: completed }), signal });
+  await saveResumeState(key,{...resumable,parts:completed,phase:"confirming"});onPhase?.("confirming");
+  await completeAndWait(sha256, activeSession.id, completed, signal);
   await clearResumeState(key);
   onProgress(1);
   return refreshed.nodeId;
