@@ -1,0 +1,16 @@
+[Unit]
+Description=Qiyun isolated full restore rehearsal
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qiyun-drive
+Environment=QIYUN_PROJECT_ROOT=/opt/qiyun-drive
+ExecStart=/bin/sh /opt/qiyun-drive/scripts/restore-latest.sh
+UMask=0077
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=4h
+

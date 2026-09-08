@@ -1,0 +1,15 @@
+[Unit]
+Description=Qiyun consistent database and object backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qiyun-drive
+Environment=QIYUN_PROJECT_ROOT=/opt/qiyun-drive
+ExecStart=/bin/sh /opt/qiyun-drive/scripts/backup.sh
+UMask=0077
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=4h

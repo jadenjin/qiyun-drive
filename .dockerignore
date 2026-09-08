@@ -6,3 +6,13 @@ dist
 .env
 backend/bin
 *.log
+.runtime
+ops
+.security-cache
+backups
+security_audit
+.idea
+.vinext
+build
+.env.*
+!.env.example

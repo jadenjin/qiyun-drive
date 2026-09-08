@@ -3,7 +3,7 @@
 services:
   rustfs:
     ports: !override
-      - "${RUSTFS_BIND_ADDRESS:-0.0.0.0}:9100:9000"
+      - "${RUSTFS_BIND_ADDRESS:-127.0.0.1}:9100:9000"
       - "127.0.0.1:9101:9001"
     volumes: !override
       # This is a separate ext4 loop mount backed by the mechanical disk.

@@ -1,0 +1,9 @@
+[Unit]
+Description=Qiyun host health report
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/qiyun-drive/scripts/host-health.py
+UMask=0022
+TimeoutStartSec=2m

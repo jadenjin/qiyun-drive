@@ -7,8 +7,12 @@ dist/
 .wrangler/
 .env
 .runtime/
+.security-cache/
 coverage/
 backups/
 *.log
 backend/bin/
 backend/coverage.out
+*.tsbuildinfo
+__pycache__/
+ops/

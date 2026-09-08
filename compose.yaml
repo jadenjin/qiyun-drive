@@ -8,6 +8,7 @@ x-logging: &default_logging
 
 services:
   caddy:
+    mem_limit: 128m
     build:
       context: .
       dockerfile: deploy/Dockerfile.caddy
@@ -41,6 +42,7 @@ services:
         condition: service_healthy
 
   web:
+    mem_limit: 384m
     build:
       context: .
       target: web
@@ -64,6 +66,7 @@ services:
       start_period: 15s
 
   api:
+    mem_limit: 384m
     build:
       context: ./backend
     command: ["pan-api"]
@@ -75,15 +78,18 @@ services:
       - ALL
     pids_limit: 128
     logging: *default_logging
+    volumes:
+      - ./ops:/var/lib/qiyun-ops:ro
     environment: &backend_environment
       ADDR: :8080
       DATABASE_URL: postgres://pan:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/pan?sslmode=disable
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost}
       ALLOWED_ORIGIN: ${PUBLIC_BASE_URL:-http://localhost}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MFA_ENCRYPTION_KEY: ${MFA_ENCRYPTION_KEY:-}
       TRUST_PROXY: "true"
       S3_ENDPOINT: http://rustfs:9000
-      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+      S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost}
       S3_REGION: us-east-1
       S3_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-qiyun}
       S3_SECRET_KEY: ${RUSTFS_SECRET_KEY:?Set RUSTFS_SECRET_KEY in .env}
@@ -124,6 +130,7 @@ services:
         condition: service_healthy
 
   postgres:
+    mem_limit: 384m
     build:
       context: .
       dockerfile: deploy/Dockerfile.postgres
@@ -156,6 +163,7 @@ services:
       retries: 20
 
   rustfs:
+    mem_limit: 512m
     build:
       context: .
       dockerfile: deploy/Dockerfile.rustfs

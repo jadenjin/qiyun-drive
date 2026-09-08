@@ -7,8 +7,9 @@
 		X-Frame-Options "DENY"
 		Referrer-Policy "no-referrer"
 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
-		Content-Security-Policy "base-uri 'self'; frame-ancestors 'none'; object-src 'none'"
 	}
+	@application not path /pan-objects/*
+	header @application Content-Security-Policy "base-uri 'self'; frame-ancestors 'none'; object-src 'none'"
 
 	handle /api/* {
 		reverse_proxy api:8080
@@ -16,6 +17,18 @@
 
 	handle /health/* {
 		reverse_proxy api:8080
+	}
+
+	# One browser-facing port for the app and signed object requests. Never
+	# route the S3 service root or management console through this gateway.
+	handle /pan-objects/* {
+		@unsupported not method GET HEAD PUT OPTIONS
+		respond @unsupported 405
+		# Uploaded bytes are untrusted even if their uploader supplies an
+		# image MIME type. Sandbox direct document navigation on our origin.
+		header Content-Security-Policy "sandbox; default-src 'none'; frame-ancestors 'none'"
+		header Cache-Control "no-store"
+		reverse_proxy rustfs:9000
 	}
 
 	handle {
