@@ -1,12 +1,19 @@
 package httpapi
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+type photoCursor struct {
+	Time time.Time `json:"t"`
+	ID   uuid.UUID `json:"i"`
+}
 
 func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 	a := actorFrom(r)
@@ -20,11 +27,27 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "空间不存在")
 		return
 	}
+	var cursorTime *time.Time
+	var cursorID *uuid.UUID
+	if raw := r.URL.Query().Get("cursor"); raw != "" {
+		if len(raw) > 256 {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "照片分页位置无效，请刷新")
+			return
+		}
+		var cursor photoCursor
+		decoded, err := base64.RawURLEncoding.DecodeString(raw)
+		if err != nil || json.Unmarshal(decoded, &cursor) != nil || cursor.Time.IsZero() || cursor.ID == uuid.Nil {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "照片分页位置无效，请刷新")
+			return
+		}
+		cursorTime, cursorID = &cursor.Time, &cursor.ID
+	}
 	rows, err := s.db.Query(r.Context(), `
 		SELECT n.id,n.name,a.id,a.object_key,a.mime_type,a.size_bytes,p.taken_at,p.width,p.height,p.camera,p.remark,p.thumb_small_key,p.thumb_large_key,n.created_at
 		FROM nodes n JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id
 		WHERE n.space_id=$1 AND n.section='photos' AND n.deleted_at IS NULL AND a.status='ready' AND lower(split_part(a.mime_type,';',1)) IN ('image/jpeg','image/png','image/webp','image/gif','image/heic','image/heif')
-		ORDER BY COALESCE(p.taken_at,n.created_at) DESC,n.id DESC LIMIT 500`, spaceID)
+		AND ($2::timestamptz IS NULL OR (COALESCE(p.taken_at,n.created_at),n.id)<($2,$3::uuid))
+		ORDER BY COALESCE(p.taken_at,n.created_at) DESC,n.id DESC LIMIT 121`, spaceID, cursorTime, cursorID)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -56,6 +79,17 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rows.Close()
+	var nextCursor string
+	if len(records) > 120 {
+		records = records[:120]
+		last := records[len(records)-1]
+		stamp := last.createdAt
+		if last.takenAt != nil {
+			stamp = *last.takenAt
+		}
+		encoded, _ := json.Marshal(photoCursor{stamp, last.nodeID})
+		nextCursor = base64.RawURLEncoding.EncodeToString(encoded)
+	}
 	permissions, err := s.nodePermissions(r.Context(), a, spaceID, ids)
 	if err != nil {
 		internalError(w, err)
@@ -83,7 +117,7 @@ func (s *Server) listPhotos(w http.ResponseWriter, r *http.Request) {
 			"remark": item.remark, "thumbUrl": thumbURL, "previewUrl": previewURL, "permission": permissionName(permission),
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "nextCursor": nextCursor})
 }
 
 func (s *Server) updatePhoto(w http.ResponseWriter, r *http.Request) {
@@ -140,9 +174,9 @@ func (s *Server) listAlbums(w http.ResponseWriter, r *http.Request) {
 		        JOIN nodes n ON n.id=cover_item.node_id
 		        JOIN assets asset ON asset.id=n.asset_id
 		        LEFT JOIN photo_details p ON p.asset_id=asset.id
-		        WHERE cover_item.album_id=a.id AND n.deleted_at IS NULL AND asset.status='ready'
+		        WHERE cover_item.album_id=a.id AND n.deleted_at IS NULL AND asset.status='ready' AND can_republish_photo(cover_item.created_by,n.id)
 		        ORDER BY COALESCE(p.taken_at,n.created_at) DESC,cover_item.created_at DESC LIMIT 1)
-		FROM albums a LEFT JOIN album_items i ON i.album_id=a.id
+		FROM albums a LEFT JOIN album_items i ON i.album_id=a.id AND can_republish_photo(i.created_by,i.node_id)
 		WHERE a.space_id=$1 GROUP BY a.id ORDER BY a.updated_at DESC`, spaceID)
 	if err != nil {
 		internalError(w, err)
@@ -292,11 +326,12 @@ func (s *Server) deleteAlbum(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "相册不存在")
 		return
 	}
-	if _, err := s.db.Exec(r.Context(), `DELETE FROM albums WHERE id=$1`, albumID); err != nil {
+	var spaceID uuid.UUID
+	if err := s.db.QueryRow(r.Context(), `DELETE FROM albums WHERE id=$1 RETURNING space_id`, albumID).Scan(&spaceID); err != nil {
 		internalError(w, err)
 		return
 	}
-	s.audit(r.Context(), a, "album.delete", "album", &albumID, nil)
+	s.auditForSpace(r.Context(), a, "album.delete", "album", &albumID, &spaceID, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -322,17 +357,31 @@ func (s *Server) addAlbumItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var albumSpace uuid.UUID
-	_ = s.db.QueryRow(r.Context(), `SELECT space_id FROM albums WHERE id=$1`, albumID).Scan(&albumSpace)
+	if err := s.db.QueryRow(r.Context(), `SELECT space_id FROM albums WHERE id=$1`, albumID).Scan(&albumSpace); err != nil {
+		internalError(w, err)
+		return
+	}
 	added := 0
 	for _, nodeID := range input.NodeIDs {
-		permission, err := s.nodePermission(r.Context(), a, nodeID)
-		if err != nil || permission < permissionViewer {
-			continue
+		var allowed bool
+		if err := s.db.QueryRow(r.Context(), `SELECT can_republish_photo($1,$2)`, a.UserID, nodeID).Scan(&allowed); err != nil {
+			internalError(w, err)
+			return
 		}
-		result, err := s.db.Exec(r.Context(), `INSERT INTO album_items(album_id,node_id,created_by) SELECT $1,n.id,$2 FROM nodes n JOIN assets a ON a.id=n.asset_id WHERE n.id=$3 AND n.space_id=$4 AND n.section='photos' AND n.deleted_at IS NULL AND a.status='ready' AND a.mime_type LIKE 'image/%' ON CONFLICT DO NOTHING`, albumID, a.UserID, nodeID, albumSpace)
-		if err == nil {
-			added += int(result.RowsAffected())
+		if !allowed {
+			writeError(w, http.StatusForbidden, "photo_republish_forbidden", "仅照片管理者，或仍有编辑权限的上传者，可以将照片授权给相册成员")
+			return
 		}
+		result, err := s.db.Exec(r.Context(), `INSERT INTO album_items(album_id,node_id,created_by) SELECT $1,n.id,$2 FROM nodes n JOIN assets a ON a.id=n.asset_id WHERE n.id=$3 AND n.space_id=$4 AND n.section='photos' AND n.deleted_at IS NULL AND a.status='ready' AND a.mime_type LIKE 'image/%' ON CONFLICT(album_id,node_id) DO UPDATE SET created_by=EXCLUDED.created_by`, albumID, a.UserID, nodeID, albumSpace)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		if result.RowsAffected() == 0 {
+			writeError(w, http.StatusBadRequest, "invalid_photo", "照片必须与相册位于同一空间")
+			return
+		}
+		added += int(result.RowsAffected())
 	}
 	s.audit(r.Context(), a, "album.items_add", "album", &albumID, map[string]any{"count": added})
 	writeJSON(w, http.StatusOK, map[string]any{"added": added})
@@ -379,7 +428,7 @@ func (s *Server) listAlbumItems(w http.ResponseWriter, r *http.Request) {
 		SELECT n.id,n.name,a.object_key,p.thumb_small_key,p.thumb_large_key,p.remark,p.taken_at,n.created_at
 		FROM album_items i JOIN nodes n ON n.id=i.node_id JOIN assets a ON a.id=n.asset_id
 		LEFT JOIN photo_details p ON p.asset_id=a.id
-		WHERE i.album_id=$1 AND n.deleted_at IS NULL AND a.status='ready'
+		WHERE i.album_id=$1 AND n.deleted_at IS NULL AND a.status='ready' AND can_republish_photo(i.created_by,n.id)
 		ORDER BY COALESCE(p.taken_at,n.created_at) DESC,i.created_at DESC`, albumID)
 	if err != nil {
 		internalError(w, err)

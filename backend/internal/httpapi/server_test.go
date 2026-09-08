@@ -4,11 +4,56 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"pan/backend/internal/config"
 )
+
+func TestPasswordWorkRejectsConcurrentExcessAndReleasesSlots(t *testing.T) {
+	s := &Server{passwordSlots: make(chan struct{}, 2)}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	handler := s.limitPasswordWork(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	var workers sync.WaitGroup
+	for range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/", nil))
+		}()
+	}
+	<-entered
+	<-entered
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
+	if recorder.Code != http.StatusTooManyRequests || recorder.Header().Get("Retry-After") == "" {
+		t.Errorf("excess password work was not rejected: %d", recorder.Code)
+	}
+	close(release)
+	workers.Wait()
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/", nil))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("password slot was leaked: %d", recorder.Code)
+	}
+}
+
+func TestUploadPathResourceBounds(t *testing.T) {
+	for _, value := range []string{strings.Repeat("a/", 64) + "file", strings.Repeat("a", 4097)} {
+		if _, err := cleanRelativePath(value); err == nil {
+			t.Fatal("unbounded upload path accepted")
+		}
+	}
+	if _, err := cleanRelativePath("家庭/旅行/photo.jpg"); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestDecodeJSONRejectsTrailingPayload(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/test", strings.NewReader(`{"name":"ok"} {"extra":true}`))

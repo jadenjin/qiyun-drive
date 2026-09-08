@@ -224,7 +224,7 @@ func (s *Server) publicShare(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		response["name"], response["description"] = name, description
-		rows, err := s.db.Query(r.Context(), `SELECT n.name,a.object_key,p.thumb_small_key,p.remark,COALESCE(p.taken_at,n.created_at) FROM album_items i JOIN nodes n ON n.id=i.node_id JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id WHERE i.album_id=$1 AND n.deleted_at IS NULL ORDER BY i.position,i.created_at LIMIT 1000`, resourceID)
+		rows, err := s.db.Query(r.Context(), `SELECT n.name,a.object_key,p.thumb_small_key,p.remark,COALESCE(p.taken_at,n.created_at) FROM album_items i JOIN nodes n ON n.id=i.node_id JOIN assets a ON a.id=n.asset_id LEFT JOIN photo_details p ON p.asset_id=a.id WHERE i.album_id=$1 AND n.deleted_at IS NULL AND can_republish_photo(i.created_by,n.id) ORDER BY i.position,i.created_at LIMIT 1000`, resourceID)
 		if err != nil {
 			internalError(w, err)
 			return
@@ -384,7 +384,7 @@ func (s *Server) publicShareArchive(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "分享内容不存在")
 			return
 		}
-		rows, err := s.db.Query(r.Context(), `SELECT n.name,a.object_key FROM album_items i JOIN nodes n ON n.id=i.node_id JOIN assets a ON a.id=n.asset_id WHERE i.album_id=$1 AND n.deleted_at IS NULL AND a.status='ready' ORDER BY i.position,i.created_at`, resourceID)
+		rows, err := s.db.Query(r.Context(), `SELECT n.name,a.object_key FROM album_items i JOIN nodes n ON n.id=i.node_id JOIN assets a ON a.id=n.asset_id WHERE i.album_id=$1 AND n.deleted_at IS NULL AND a.status='ready' AND can_republish_photo(i.created_by,n.id) ORDER BY i.position,i.created_at`, resourceID)
 		if err != nil {
 			internalError(w, err)
 			return
@@ -402,7 +402,7 @@ func (s *Server) publicShareArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s.zip", pathEscape(archiveName)))
-	zw := zip.NewWriter(w)
+	zw := zip.NewWriter(archiveWriter{r.Context(), w})
 	defer zw.Close()
 	for _, entry := range entries {
 		body, err := s.store.Get(r.Context(), entry.Key)
@@ -428,7 +428,9 @@ func (s *Server) listAudit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "forbidden", "只有家庭管理员可以查看审计记录")
 		return
 	}
-	rows, err := s.db.Query(r.Context(), `SELECT e.id,e.action,e.resource_type,e.resource_id,e.metadata,e.created_at,u.display_name FROM audit_events e LEFT JOIN users u ON u.id=e.actor_user_id WHERE e.household_id=$1 ORDER BY e.created_at DESC LIMIT 200`, a.HouseholdID)
+	// Visibility is captured when the event is written; deleting content
+	// must not erase family governance history or expose personal metadata.
+	rows, err := s.db.Query(r.Context(), `SELECT e.id,e.action,e.resource_type,e.resource_id,e.metadata,e.created_at,u.display_name FROM audit_events e LEFT JOIN users u ON u.id=e.actor_user_id WHERE e.household_id=$1 AND (e.visibility='family' OR e.actor_user_id=$2) ORDER BY e.created_at DESC LIMIT 200`, a.HouseholdID, a.UserID)
 	if err != nil {
 		internalError(w, err)
 		return

@@ -14,7 +14,14 @@ import (
 var migrations embed.FS
 
 func Open(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, databaseURL)
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// API request transactions and worker transactions share the same
+	// isolation, including permission and subtree predicate reads.
+	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "serializable"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}

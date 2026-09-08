@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -145,6 +146,132 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 	_, otherMemberSessionID := seedLiveSession(t, ctx, pool, memberID)
 	createdSessionIDs = append(createdSessionIDs, ownerSessionID, adminSessionID, memberSessionID, otherMemberSessionID)
 	ownerCookie, adminCookie, memberCookie := "pan_session="+ownerToken, "pan_session="+adminToken, "pan_session="+memberToken
+	if os.Getenv("PAN_LIVE_PUBLICATION") == "1" {
+		t.Run("immutable upload publication", func(t *testing.T) { exerciseImmutableUpload(t, baseURL, memberCookie, personalSpaceID, pool) })
+	}
+	if os.Getenv("PAN_LIVE_PUBLICATION_ONLY") == "1" {
+		return
+	}
+
+	t.Run("operations are owner only and omit private job errors", func(t *testing.T) {
+		for _, cookie := range []string{adminCookie, memberCookie} {
+			status, body := liveJSON(t, http.MethodGet, baseURL+"/admin/operations", cookie, "", nil)
+			requireLiveStatus(t, status, 403, body)
+		}
+		id := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO jobs(id,kind,payload,state,last_error) VALUES($1,'index_photo','{}','failed','private-secret.jpg: format error')`, id); err != nil {
+			t.Fatal(err)
+		}
+		defer pool.Exec(ctx, `DELETE FROM jobs WHERE id=$1`, id)
+		status, body := liveJSON(t, http.MethodGet, baseURL+"/admin/operations", ownerCookie, "", nil)
+		requireLiveStatus(t, status, 200, body)
+		if bytes.Contains(body, []byte("private-secret")) || !bytes.Contains(body, []byte("照片索引失败")) {
+			t.Fatalf("unexpected operations response: %s", body)
+		}
+	})
+
+	t.Run("concurrent opposite moves cannot create a directory cycle", func(t *testing.T) {
+		t.Run("delete and child creation", func(t *testing.T) { exerciseDeleteAndCreate(t, baseURL, ownerCookie, familySpaceID, ownerID, pool) })
+		left, right := uuid.New(), uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO nodes(id,space_id,kind,name,created_by) VALUES($1,$3,'folder',$1::uuid::text,$4),($2,$3,'folder',$2::uuid::text,$4)`, left, right, familySpaceID, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		defer pool.Exec(ctx, `DELETE FROM nodes WHERE id IN ($1,$2)`, left, right)
+		createdAuditResources = append(createdAuditResources, left, right)
+		blocker, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer blocker.Rollback(ctx)
+		if _, err := blocker.Exec(ctx, `SELECT id FROM nodes WHERE id IN ($1,$2) FOR UPDATE`, left, right); err != nil {
+			t.Fatal(err)
+		}
+		var workers sync.WaitGroup
+		statuses := make(chan int, 2)
+		for _, pair := range [][2]uuid.UUID{{left, right}, {right, left}} {
+			workers.Add(1)
+			go func(pair [2]uuid.UUID) {
+				defer workers.Done()
+				status, _ := liveJSON(t, http.MethodPost, baseURL+"/nodes/"+pair[0].String()+"/move", ownerCookie, "", map[string]any{"parentId": pair[1]})
+				statuses <- status
+			}(pair)
+		}
+		// Wait until both requests have reached their write with the original
+		// acyclic snapshot, then let them contend for the rows.
+		waiting := 0
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'UPDATE nodes SET parent_id=%'`).Scan(&waiting); err != nil {
+				t.Error(err)
+				break
+			}
+			if waiting >= 2 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if err := blocker.Commit(ctx); err != nil {
+			t.Error(err)
+		}
+		workers.Wait()
+		close(statuses)
+		if waiting < 2 {
+			t.Fatal("could not synchronize the competing moves")
+		}
+		success, conflict := 0, 0
+		for status := range statuses {
+			if status == http.StatusOK {
+				success++
+			}
+			if status == http.StatusConflict {
+				conflict++
+			}
+		}
+		if success != 1 || conflict != 1 {
+			t.Fatalf("expected one success and one conflict: success=%d conflict=%d", success, conflict)
+		}
+		var cycle bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM nodes a JOIN nodes b ON a.parent_id=b.id AND b.parent_id=a.id WHERE a.id=$1)`, left).Scan(&cycle); err != nil || cycle {
+			t.Fatalf("concurrent moves created a cycle: %v", err)
+		}
+	})
+
+	t.Run("initialized bootstrap rejects before parsing password", func(t *testing.T) {
+		status, body := liveJSON(t, http.MethodPost, baseURL+"/bootstrap", "", "", map[string]any{})
+		requireLiveStatus(t, status, http.StatusConflict, body)
+	})
+
+	t.Run("restricted descendants cannot be moved through parent", func(t *testing.T) {
+		status, body := liveJSON(t, http.MethodPost, baseURL+"/nodes/"+parentID.String()+"/move", memberCookie, "", map[string]any{"parentId": nil})
+		requireLiveStatus(t, status, http.StatusForbidden, body)
+	})
+
+	t.Run("personal file metadata stays out of household audit", func(t *testing.T) {
+		const privateName = "private-audit-regression-name"
+		status, body := liveJSON(t, http.MethodPatch, baseURL+"/nodes/"+privateFolderID.String(), memberCookie, "", map[string]any{"name": privateName})
+		requireLiveStatus(t, status, http.StatusOK, body)
+		createdAuditResources = append(createdAuditResources, privateFolderID)
+		status, body = liveJSON(t, http.MethodGet, baseURL+"/admin/audit", ownerCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		if bytes.Contains(body, []byte(privateName)) || bytes.Contains(body, []byte(privateFolderID.String())) {
+			t.Fatal("another member's private resource leaked in household audit")
+		}
+	})
+
+	t.Run("family album deletion preserves audit visibility", func(t *testing.T) {
+		id := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO albums(id,space_id,name,created_by) VALUES($1,$2,'audit-delete-fixture',$3)`, id, familySpaceID, memberID); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM albums WHERE id=$1`, id) })
+		createdAuditResources = append(createdAuditResources, id)
+		status, body := liveJSON(t, http.MethodDelete, baseURL+"/albums/"+id.String(), memberCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusNoContent, body)
+		status, body = liveJSON(t, http.MethodGet, baseURL+"/admin/audit", ownerCookie, "", nil)
+		requireLiveStatus(t, status, http.StatusOK, body)
+		if !bytes.Contains(body, []byte(id.String())) || !bytes.Contains(body, []byte("album.delete")) {
+			t.Fatal("deleted family album audit disappeared")
+		}
+	})
 
 	t.Run("session inventory and revocation", func(t *testing.T) {
 		status, body := liveJSON(t, http.MethodGet, baseURL+"/me/sessions", memberCookie, "", nil)
@@ -176,6 +303,7 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 	})
 
 	t.Run("administrative role boundaries", func(t *testing.T) {
+		t.Run("optional MFA and recovery", func(t *testing.T) { exerciseMFA(t, baseURL, memberCookie, "stage4-member-"+suffix, memberID, pool) })
 		status, body := liveJSON(t, http.MethodPost, baseURL+"/invitations", adminCookie, "", map[string]any{"role": "admin"})
 		requireLiveStatus(t, status, http.StatusForbidden, body)
 		status, body = liveJSON(t, http.MethodPatch, baseURL+"/members/"+memberID.String(), adminCookie, "", map[string]any{"role": "admin"})
@@ -198,7 +326,68 @@ func TestLiveAccountAndAuthorizationBoundaries(t *testing.T) {
 		requireLiveStatus(t, status, http.StatusConflict, body)
 	})
 
+	t.Run("album republication requires source authority and tracks revocation", func(t *testing.T) {
+		id := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO albums(id,space_id,name,created_by) VALUES($1,$2,'republish-test',$3)`, id, familySpaceID, memberID); err != nil {
+			t.Fatal(err)
+		}
+		defer pool.Exec(ctx, `DELETE FROM albums WHERE id=$1`, id)
+		defer pool.Exec(ctx, `DELETE FROM acl_entries WHERE resource_type='node' AND resource_id=$1`, accessiblePhotoID)
+		defer pool.Exec(ctx, `UPDATE nodes SET created_by=$2 WHERE id=$1`, accessiblePhotoID, memberID)
+		createdAuditResources = append(createdAuditResources, id)
+		add := func(want int) {
+			status, body := liveJSON(t, http.MethodPost, baseURL+"/albums/"+id.String()+"/items", memberCookie, "", map[string]any{"nodeIds": []uuid.UUID{accessiblePhotoID}})
+			requireLiveStatus(t, status, want, body)
+		}
+		// An uploader with editor access may publish their own photo.
+		add(http.StatusOK)
+		if _, err := pool.Exec(ctx, `UPDATE nodes SET created_by=$2 WHERE id=$1`, accessiblePhotoID, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		// Editing someone else's photo does not grant republication authority.
+		add(http.StatusForbidden)
+		aclID := uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO acl_entries(id,resource_type,resource_id,principal_user_id,permission,created_by) VALUES($1,'node',$2,$3,'viewer',$4)`, aclID, accessiblePhotoID, memberID, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		add(http.StatusForbidden)
+		if _, err := pool.Exec(ctx, `UPDATE acl_entries SET permission='manager' WHERE id=$1`, aclID); err != nil {
+			t.Fatal(err)
+		}
+		add(http.StatusOK)
+		shareID := uuid.New()
+		shareToken, shareHash, _ := panAuth.NewToken(32)
+		accessToken, accessHash, _ := panAuth.NewToken(32)
+		if _, err := pool.Exec(ctx, `INSERT INTO public_shares(id,resource_type,resource_id,token_hash,created_by) VALUES($1,'album',$2,$3,$4)`, shareID, id, shareHash, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		createdShareIDs = append(createdShareIDs, shareID)
+		if _, err := pool.Exec(ctx, `INSERT INTO share_access_tokens(id,share_id,token_hash,expires_at) VALUES($1,$2,$3,now()+interval '1 hour')`, uuid.New(), shareID, accessHash); err != nil {
+			t.Fatal(err)
+		}
+		check := func(visible bool) {
+			for _, request := range []struct{ path, cookie, bearer string }{
+				{"/albums/" + id.String() + "/items", ownerCookie, ""},
+				{"/public/shares/" + shareToken, "", accessToken},
+			} {
+				status, body := liveJSON(t, http.MethodGet, baseURL+request.path, request.cookie, request.bearer, nil)
+				requireLiveStatus(t, status, http.StatusOK, body)
+				if bytes.Contains(body, []byte("stage5-visible.png")) != visible {
+					t.Fatalf("album visibility mismatch: %s", request.path)
+				}
+			}
+		}
+		check(true)
+		if _, err := pool.Exec(ctx, `UPDATE acl_entries SET permission='viewer' WHERE id=$1`, aclID); err != nil {
+			t.Fatal(err)
+		}
+		check(false)
+	})
+
 	t.Run("batch listings preserve permission boundaries", func(t *testing.T) {
+		t.Run("more than 500 photos with equal dates and restricted items", func(t *testing.T) {
+			exercisePhotoPagination(t, baseURL, memberCookie, familySpaceID, memberID, pool)
+		})
 		status, body := liveJSON(t, http.MethodGet, baseURL+"/nodes?spaceId="+familySpaceID.String()+"&parentId="+parentID.String(), memberCookie, "", nil)
 		requireLiveStatus(t, status, http.StatusOK, body)
 		var nodes struct {

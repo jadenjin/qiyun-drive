@@ -120,11 +120,11 @@ test("drive UI exposes complete album, file-management, permission, and account 
   assert.match(drive, /有效分享/);
   assert.match(drive, /历史记录/);
   assert.match(routes, /Get\("\/folders\/tree", s\.listFolderTree\)/);
-  assert.match(routes, /Post\("\/nodes\/\{id\}\/move", s\.moveNode\)/);
+  assert.match(routes, /Post\("\/nodes\/\{id\}\/move", s\.write\(\(\*Server\)\.moveNode\)\)/);
   assert.match(routes, /Get\("\/nodes\/\{id\}\/permissions", s\.getNodePermissions\)/);
-  assert.match(routes, /Post\("\/me\/password", s\.changePassword\)/);
+  assert.match(routes, /Post\("\/me\/password", s\.write\(\(\*Server\)\.changePassword\)\)/);
   assert.match(routes, /Get\("\/me\/sessions", s\.listSessions\)/);
-  assert.match(routes, /Delete\("\/me\/sessions\/\{id\}", s\.revokeSession\)/);
+  assert.match(routes, /Delete\("\/me\/sessions\/\{id\}", s\.write\(\(\*Server\)\.revokeSession\)\)/);
   assert.match(nodes, /func \(s \*Server\) moveNode/);
   assert.match(acl, /func \(s \*Server\) getNodePermissions/);
   assert.match(auth, /func \(s \*Server\) updateMemberRole/);

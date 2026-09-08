@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,7 +46,8 @@ func main() {
 		slog.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	db, err := database.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("database unavailable", "error", err)
@@ -53,14 +56,43 @@ func main() {
 	defer db.Close()
 	w := &worker{db: db, store: storage.New(cfg), cfg: cfg}
 	slog.Info("worker started")
+	go func() {
+		heartbeat := time.NewTicker(15 * time.Second)
+		defer heartbeat.Stop()
+		for {
+			if _, err := db.Exec(ctx, `INSERT INTO runtime_health(component) VALUES('worker') ON CONFLICT(component) DO UPDATE SET updated_at=now()`); err != nil && ctx.Err() == nil {
+				slog.Error("worker heartbeat failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeat.C:
+			}
+		}
+	}()
+	go func() {
+		maintenance := time.NewTicker(30 * time.Second)
+		defer maintenance.Stop()
+		for {
+			w.runMaintenance(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-maintenance.C:
+			}
+		}
+	}()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		if err := w.runOne(ctx); err != nil {
 			slog.Error("job failed", "error", err)
 		}
-		w.runMaintenance(ctx)
-		<-ticker.C
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -87,9 +119,35 @@ func (w *worker) runOne(ctx context.Context) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	jobCtx, cancel := context.WithTimeout(ctx, jobTimeout)
+	timeout := jobTimeout
+	if j.Kind == "finalize_upload" || j.Kind == "seal_legacy_asset" {
+		timeout = 24 * time.Hour
+	}
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	claimedAttempt := j.Attempts + 1
+	// Refresh the lease while a large finalization streams without buffering.
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-jobCtx.Done():
+				return
+			case <-ticker.C:
+				result, err := w.db.Exec(jobCtx, `UPDATE jobs SET locked_at=now() WHERE id=$1 AND state='running' AND attempts=$2`, j.ID, claimedAttempt)
+				if err == nil && result.RowsAffected() == 0 {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	switch j.Kind {
+	case "finalize_upload":
+		err = w.finalizeUpload(jobCtx, j.Payload)
+	case "seal_legacy_asset":
+		err = w.sealLegacyAsset(jobCtx, j.Payload)
 	case "index_photo":
 		err = w.indexPhoto(jobCtx, j.Payload)
 	case "purge_node":
@@ -100,11 +158,25 @@ func (w *worker) runOne(ctx context.Context) error {
 		err = fmt.Errorf("unknown job kind %q", j.Kind)
 	}
 	if err == nil {
-		_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='done',locked_at=NULL,updated_at=now(),last_error=NULL WHERE id=$1`, j.ID)
+		_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='done',locked_at=NULL,updated_at=now(),last_error=NULL WHERE id=$1 AND state='running' AND attempts=$2`, j.ID, claimedAttempt)
 		return nil
 	}
+	if j.Kind == "finalize_upload" && errors.Is(err, storage.ErrIntegrity) {
+		j.Attempts = 5
+	}
 	backoff := time.Duration(1<<min(j.Attempts, 5)) * time.Minute
-	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error=$1,run_after=$2,updated_at=now() WHERE id=$3`, truncateError(err), time.Now().Add(backoff), j.ID)
+	result, updateErr := w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error=$1,run_after=$2,updated_at=now(),attempts=$4 WHERE id=$3 AND state='running' AND attempts=$5`, truncateError(err), time.Now().Add(backoff), j.ID, j.Attempts+1, claimedAttempt)
+	if updateErr != nil {
+		return fmt.Errorf("record failed job: %w", updateErr)
+	}
+	if result.RowsAffected() == 0 {
+		return err
+	}
+	if j.Kind == "finalize_upload" && j.Attempts+1 >= 6 {
+		if failErr := w.failFinalization(ctx, j.Payload); failErr != nil {
+			slog.Error("release failed upload", "error", failErr)
+		}
+	}
 	if j.Kind == "purge_node" && j.Attempts+1 >= 6 {
 		// Give the user a recovery path after the final failed attempt. A later
 		// maintenance pass may claim the still-deleted node again.
@@ -360,6 +432,9 @@ func (w *worker) purgeNode(ctx context.Context, jobID uuid.UUID, payload []byte)
 }
 
 func (w *worker) runMaintenance(ctx context.Context) {
+	_, _ = w.db.Exec(ctx, `INSERT INTO jobs(id,kind,payload) SELECT gen_random_uuid(),'seal_legacy_asset',jsonb_build_object('assetId',a.id::text) FROM assets a WHERE a.status='ready' AND a.sha256 IS NULL AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.kind='seal_legacy_asset' AND j.payload->>'assetId'=a.id::text) ORDER BY a.created_at LIMIT 25`)
+	_, _ = w.db.Exec(ctx, `DELETE FROM security_events WHERE created_at<now()-interval '90 days'`)
+	w.cleanupObjects(ctx)
 	_, _ = w.db.Exec(ctx, `UPDATE jobs SET state='failed',locked_at=NULL,last_error='任务执行中断，已自动恢复',run_after=now(),updated_at=now() WHERE state='running' AND locked_at<now()-interval '15 minutes'`)
 	// Reconcile the narrow crash window between a purge job exhausting its
 	// retries and runOne releasing the claim, so a deleted node cannot become
@@ -391,7 +466,7 @@ func (w *worker) enqueueExpiredUploadCleanup(ctx context.Context) {
 		INSERT INTO jobs(id,kind,payload)
 		SELECT gen_random_uuid(),'cleanup_upload',jsonb_build_object('uploadId',u.id::text)
 		FROM upload_sessions u
-		WHERE ((u.state IN ('pending','uploading','completing') AND u.expires_at<now()) OR u.state='expired' OR (u.state='failed' AND u.created_at<now()-interval '1 hour'))
+		WHERE ((u.state IN ('pending','uploading') AND u.expires_at<now()) OR u.state='expired' OR (u.state='failed' AND u.created_at<now()-interval '1 hour'))
 		AND NOT EXISTS(
 			SELECT 1 FROM jobs j WHERE j.kind='cleanup_upload'
 			AND (j.state IN ('pending','running') OR (j.state='failed' AND (j.attempts<6 OR j.updated_at>now()-interval '24 hours')))
@@ -417,7 +492,7 @@ func (w *worker) cleanupUpload(ctx context.Context, payload []byte) error {
 	var expected int64
 	var expiresAt, createdAt time.Time
 	err = w.db.QueryRow(ctx, `
-		SELECT u.node_id,u.asset_id,a.space_id,a.object_key,u.upload_id,u.expected_size,u.state,u.expires_at,u.created_at
+		SELECT u.node_id,u.asset_id,a.space_id,COALESCE(u.staging_key,a.object_key),u.upload_id,u.expected_size,u.state,u.expires_at,u.created_at
 		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id WHERE u.id=$1`, uploadID).Scan(&nodeID, &assetID, &spaceID, &key, &multipartID, &expected, &state, &expiresAt, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
@@ -430,7 +505,7 @@ func (w *worker) cleanupUpload(ctx context.Context, payload []byte) error {
 		return nil
 	}
 	if state != "expired" && activeExpired {
-		claim, err := w.db.Exec(ctx, `UPDATE upload_sessions SET state='expired' WHERE id=$1 AND state IN ('pending','uploading','completing') AND expires_at<now()`, uploadID)
+		claim, err := w.db.Exec(ctx, `UPDATE upload_sessions SET state='expired' WHERE id=$1 AND state IN ('pending','uploading') AND expires_at<now()`, uploadID)
 		if err != nil {
 			return err
 		}
@@ -441,7 +516,7 @@ func (w *worker) cleanupUpload(ctx context.Context, payload []byte) error {
 	}
 	if multipartID != nil {
 		if err := w.store.AbortMultipart(ctx, key, *multipartID); err != nil {
-			slog.Warn("abort expired multipart", "upload_id", uploadID, "error", err)
+			return fmt.Errorf("abort expired multipart: %w", err)
 		}
 	}
 	if err := w.store.Delete(ctx, key); err != nil {
@@ -479,7 +554,7 @@ func (w *worker) cleanupUpload(ctx context.Context, payload []byte) error {
 }
 
 func cleanupEligibility(state string, expiresAt, createdAt, now time.Time) (activeExpired, failedExpired bool) {
-	activeExpired = ((state == "pending" || state == "uploading" || state == "completing") && expiresAt.Before(now)) || state == "expired"
+	activeExpired = ((state == "pending" || state == "uploading") && expiresAt.Before(now)) || state == "expired"
 	failedExpired = state == "failed" && createdAt.Before(now.Add(-time.Hour))
 	return activeExpired, failedExpired
 }

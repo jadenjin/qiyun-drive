@@ -1,9 +1,27 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestMFAEncryptionKeyValidation(t *testing.T) {
+	for _, key := range []string{"", strings.Repeat("ab", 32)} {
+		cfg := validConfig()
+		cfg.MFAEncryptionKey = key
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, key := range []string{"short", strings.Repeat("ab", 16), strings.Repeat("zz", 32)} {
+		cfg := validConfig()
+		cfg.MFAEncryptionKey = key
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("invalid MFA key accepted")
+		}
+	}
+}
 
 func validConfig() Config {
 	return Config{

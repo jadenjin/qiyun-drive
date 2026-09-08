@@ -2,13 +2,14 @@ package httpapi
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ type uploadRecord struct {
 	UserID       uuid.UUID
 	SpaceID      uuid.UUID
 	ObjectKey    string
+	StagingKey   string
 	MimeType     string
 	UploadID     *string
 	Method       string
@@ -105,6 +107,9 @@ func (s *Server) createUploadBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func cleanRelativePath(value string) ([]string, error) {
+	if len(value) > 4096 {
+		return nil, fmt.Errorf("path is too long")
+	}
 	value = strings.ReplaceAll(value, "\\", "/")
 	if strings.HasPrefix(value, "/") {
 		return nil, fmt.Errorf("absolute paths are not allowed")
@@ -114,6 +119,9 @@ func cleanRelativePath(value string) ([]string, error) {
 		return nil, nil
 	}
 	parts := strings.Split(value, "/")
+	if len(parts) > 64 {
+		return nil, fmt.Errorf("path is too deep")
+	}
 	for i, part := range parts {
 		name, err := cleanName(part)
 		if err != nil {
@@ -219,6 +227,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	assetID, nodeID, sessionID := uuid.New(), uuid.New(), uuid.New()
 	objectKey := fmt.Sprintf("original/%s/%s", input.SpaceID, assetID)
+	stagingKey := "staging/" + sessionID.String()
 	expires := time.Now().Add(s.cfg.UploadTTL)
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
@@ -277,9 +286,13 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.Exec(r.Context(), `INSERT INTO nodes(id,space_id,parent_id,asset_id,kind,name,section,created_by) VALUES($1,$2,$3,$4,'file',$5,$6,$7)`, nodeID, input.SpaceID, parentID, assetID, name, input.Section, a.UserID)
 	}
 	if err == nil {
-		_, err = tx.Exec(r.Context(), `INSERT INTO upload_sessions(id,batch_id,asset_id,node_id,user_id,method,expected_size,state,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,'uploading',$8)`, sessionID, input.BatchID, assetID, nodeID, a.UserID, method, input.SizeBytes, expires)
+		_, err = tx.Exec(r.Context(), `INSERT INTO upload_sessions(id,batch_id,asset_id,node_id,user_id,method,expected_size,state,expires_at,staging_key) VALUES($1,$2,$3,$4,$5,$6,$7,'uploading',$8,$9)`, sessionID, input.BatchID, assetID, nodeID, a.UserID, method, input.SizeBytes, expires, stagingKey)
 	}
 	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `INSERT INTO object_cleanup(object_key,delete_after) VALUES($1,$3),($2,$3)`, stagingKey, objectKey, expires.Add(s.cfg.PresignTTL+time.Hour)); err != nil {
 		internalError(w, err)
 		return
 	}
@@ -289,7 +302,7 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	response := map[string]any{"id": sessionID, "nodeId": nodeID, "method": method, "name": name, "expiresAt": expires}
 	if method == "put" {
-		url, err := s.store.PresignPut(r.Context(), objectKey, input.MimeType)
+		url, err := s.store.PresignPut(r.Context(), stagingKey, input.MimeType, input.SizeBytes)
 		if err != nil {
 			s.failUpload(r.Context(), sessionID, assetID, input.SpaceID, input.SizeBytes)
 			internalError(w, err)
@@ -297,15 +310,22 @@ func (s *Server) createUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		response["url"] = url
 	} else {
-		uploadID, err := s.store.CreateMultipart(r.Context(), objectKey, input.MimeType)
+		uploadID, err := s.store.CreateMultipart(r.Context(), stagingKey, input.MimeType)
 		if err != nil {
 			s.failUpload(r.Context(), sessionID, assetID, input.SpaceID, input.SizeBytes)
 			internalError(w, err)
 			return
 		}
+		if s.onRollback != nil {
+			*s.onRollback = append(*s.onRollback, func(ctx context.Context) { _ = s.store.AbortMultipart(ctx, stagingKey, uploadID) })
+		}
 		if _, err := s.db.Exec(r.Context(), `UPDATE upload_sessions SET upload_id=$1 WHERE id=$2`, uploadID, sessionID); err != nil {
-			_ = s.store.AbortMultipart(r.Context(), objectKey, uploadID)
+			_ = s.store.AbortMultipart(r.Context(), stagingKey, uploadID)
 			s.failUpload(r.Context(), sessionID, assetID, input.SpaceID, input.SizeBytes)
+			internalError(w, err)
+			return
+		}
+		if _, err := s.db.Exec(r.Context(), `UPDATE object_cleanup SET multipart_id=$2 WHERE object_key=$1`, stagingKey, uploadID); err != nil {
 			internalError(w, err)
 			return
 		}
@@ -390,9 +410,9 @@ func (s *Server) failUpload(ctx context.Context, sessionID, assetID, spaceID uui
 func (s *Server) getUpload(ctx context.Context, id, userID uuid.UUID) (uploadRecord, error) {
 	var item uploadRecord
 	err := s.db.QueryRow(ctx, `
-		SELECT u.id,u.asset_id,u.node_id,u.user_id,a.space_id,a.object_key,a.mime_type,u.upload_id,u.method,u.expected_size,u.state,n.section,u.expires_at
+		SELECT u.id,u.asset_id,u.node_id,u.user_id,a.space_id,a.object_key,COALESCE(u.staging_key,a.object_key),a.mime_type,u.upload_id,u.method,u.expected_size,u.state,n.section,u.expires_at
 		FROM upload_sessions u JOIN assets a ON a.id=u.asset_id JOIN nodes n ON n.id=u.node_id
-		WHERE u.id=$1 AND u.user_id=$2`, id, userID).Scan(&item.ID, &item.AssetID, &item.NodeID, &item.UserID, &item.SpaceID, &item.ObjectKey, &item.MimeType, &item.UploadID, &item.Method, &item.ExpectedSize, &item.State, &item.Section, &item.ExpiresAt)
+		WHERE u.id=$1 AND u.user_id=$2`, id, userID).Scan(&item.ID, &item.AssetID, &item.NodeID, &item.UserID, &item.SpaceID, &item.ObjectKey, &item.StagingKey, &item.MimeType, &item.UploadID, &item.Method, &item.ExpectedSize, &item.State, &item.Section, &item.ExpiresAt)
 	return item, err
 }
 
@@ -428,7 +448,7 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 	items := make([]map[string]any, 0, len(input.PartNumbers))
 	seen := make(map[int32]struct{}, len(input.PartNumbers))
 	for _, number := range input.PartNumbers {
-		if number < 1 || number > 10000 {
+		if number < 1 || number > 10000 || int64(number-1)*choosePartSize(upload.ExpectedSize) >= upload.ExpectedSize {
 			writeError(w, http.StatusBadRequest, "invalid_parts", "分片编号不合法")
 			return
 		}
@@ -437,7 +457,7 @@ func (s *Server) presignParts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seen[number] = struct{}{}
-		url, err := s.store.PresignPart(r.Context(), upload.ObjectKey, *upload.UploadID, number)
+		url, err := s.store.PresignPart(r.Context(), upload.StagingKey, *upload.UploadID, number, min(choosePartSize(upload.ExpectedSize), upload.ExpectedSize-int64(number-1)*choosePartSize(upload.ExpectedSize)))
 		if err != nil {
 			internalError(w, err)
 			return
@@ -458,6 +478,10 @@ func (s *Server) resumeUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
 		return
 	}
+	if upload.State == "completing" {
+		writeJSON(w, http.StatusAccepted, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "completing"})
+		return
+	}
 	if upload.State == "ready" {
 		writeJSON(w, http.StatusOK, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "ready"})
 		return
@@ -473,7 +497,7 @@ func (s *Server) resumeUpload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
 			return
 		}
-		url, err := s.store.PresignPut(r.Context(), upload.ObjectKey, mime)
+		url, err := s.store.PresignPut(r.Context(), upload.StagingKey, mime, upload.ExpectedSize)
 		if err != nil {
 			internalError(w, err)
 			return
@@ -495,44 +519,19 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	upload, err := s.getUpload(r.Context(), id, a.UserID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
-		return
-	}
-	if upload.State == "ready" {
-		writeJSON(w, http.StatusOK, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "ready"})
-		return
-	}
-	if upload.ExpiresAt.Before(time.Now()) {
-		writeError(w, http.StatusGone, "upload_expired", "上传会话已过期")
-		return
-	}
 	var input struct {
-		Parts []storage.CompletedPart `json:"parts"`
+		Parts  []storage.CompletedPart `json:"parts"`
+		SHA256 string                  `json:"sha256"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
 	}
-	if upload.Method == "multipart" {
-		if upload.UploadID == nil || !validCompletedParts(input.Parts) {
-			writeError(w, http.StatusBadRequest, "invalid_parts", "缺少已上传分片")
+	if input.SHA256 != "" {
+		decoded, err := hex.DecodeString(input.SHA256)
+		if err != nil || len(decoded) != 32 {
+			writeError(w, http.StatusBadRequest, "invalid_checksum", "文件校验值不合法")
 			return
 		}
-		sort.Slice(input.Parts, func(i, j int) bool { return input.Parts[i].Number < input.Parts[j].Number })
-		if err := s.store.CompleteMultipart(r.Context(), upload.ObjectKey, *upload.UploadID, input.Parts); err != nil {
-			writeError(w, http.StatusConflict, "complete_failed", "分片校验失败，请重试")
-			return
-		}
-	}
-	actualSize, mime, err := s.store.Head(r.Context(), upload.ObjectKey)
-	if err != nil {
-		writeError(w, http.StatusConflict, "object_missing", "尚未检测到完整文件")
-		return
-	}
-	if actualSize != upload.ExpectedSize {
-		writeError(w, http.StatusConflict, "size_mismatch", "文件大小与上传任务不一致")
-		return
 	}
 	tx, err := s.db.Begin(r.Context())
 	if err != nil {
@@ -540,37 +539,45 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	result, err := tx.Exec(r.Context(), `UPDATE upload_sessions SET state='ready' WHERE id=$1 AND state='uploading'`, upload.ID)
+	var nodeID uuid.UUID
+	var method, state string
+	var expires time.Time
+	if err := tx.QueryRow(r.Context(), `SELECT node_id,method,state,expires_at FROM upload_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`, id, a.UserID).Scan(&nodeID, &method, &state, &expires); err != nil {
+		if !dbNotFound(w, err) {
+			internalError(w, err)
+		}
+		return
+	}
+	if state == "ready" || state == "completing" {
+		status := http.StatusOK
+		if state == "completing" {
+			status = http.StatusAccepted
+		}
+		writeJSON(w, status, map[string]any{"id": id, "nodeId": nodeID, "state": state})
+		return
+	}
+	if state != "uploading" || !expires.After(time.Now()) {
+		writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+		return
+	}
+	if err := ValidateUploadPermission(r.Context(), tx, a.UserID, nodeID); err != nil {
+		writeError(w, http.StatusForbidden, "upload_forbidden", "上传目录的编辑权限已失效")
+		return
+	}
+	if method == "multipart" && !validCompletedParts(input.Parts) {
+		writeError(w, http.StatusBadRequest, "invalid_parts", "缺少合法的已上传分片")
+		return
+	}
+	parts, err := json.Marshal(input.Parts)
 	if err != nil {
 		internalError(w, err)
 		return
 	}
-	if result.RowsAffected() == 0 {
-		writeError(w, http.StatusGone, "upload_expired", "上传会话已失效，请重新选择文件")
+	if _, err := tx.Exec(r.Context(), `UPDATE upload_sessions SET state='completing',completion_parts=$2,expected_sha256=NULLIF($3,'') WHERE id=$1`, id, parts, strings.ToLower(input.SHA256)); err != nil {
+		internalError(w, err)
 		return
 	}
-	if result.RowsAffected() > 0 {
-		effectiveMime := upload.MimeType
-		if effectiveMime == "" || strings.EqualFold(strings.Split(effectiveMime, ";")[0], "application/octet-stream") {
-			effectiveMime = mime
-		}
-		if effectiveMime == "" {
-			effectiveMime = "application/octet-stream"
-		}
-		if _, err = tx.Exec(r.Context(), `UPDATE assets SET status='ready',size_bytes=$1,mime_type=$2 WHERE id=$3`, actualSize, effectiveMime, upload.AssetID); err == nil {
-			_, err = tx.Exec(r.Context(), `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1),used_bytes=used_bytes+$2 WHERE id=$3`, upload.ExpectedSize, actualSize, upload.SpaceID)
-		}
-		if err == nil && shouldIndexPhoto(upload.Section, effectiveMime) {
-			_, err = tx.Exec(r.Context(), `INSERT INTO photo_details(asset_id) VALUES($1) ON CONFLICT DO NOTHING`, upload.AssetID)
-		}
-		if err == nil && shouldIndexPhoto(upload.Section, effectiveMime) {
-			_, err = tx.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'index_photo',jsonb_build_object('assetId',$2::text))`, uuid.New(), upload.AssetID.String())
-		}
-		if err == nil {
-			_, _ = tx.Exec(r.Context(), `UPDATE upload_batches SET completed_files=completed_files+1,state=CASE WHEN completed_files+1>=total_files THEN 'ready' ELSE state END WHERE id=(SELECT batch_id FROM upload_sessions WHERE id=$1)`, upload.ID)
-		}
-	}
-	if err != nil {
+	if _, err := tx.Exec(r.Context(), `INSERT INTO jobs(id,kind,payload) VALUES($1,'finalize_upload',jsonb_build_object('uploadId',$2::text))`, uuid.New(), id); err != nil {
 		internalError(w, err)
 		return
 	}
@@ -578,10 +585,29 @@ func (s *Server) completeUpload(w http.ResponseWriter, r *http.Request) {
 		internalError(w, err)
 		return
 	}
-	var uploadedName string
-	_ = s.db.QueryRow(r.Context(), `SELECT name FROM nodes WHERE id=$1`, upload.NodeID).Scan(&uploadedName)
-	s.audit(r.Context(), a, "node.upload", "node", &upload.NodeID, map[string]any{"name": uploadedName, "sizeBytes": actualSize})
-	writeJSON(w, http.StatusOK, map[string]any{"id": upload.ID, "nodeId": upload.NodeID, "state": "ready"})
+	writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "nodeId": nodeID, "state": "completing"})
+}
+
+// Shared with the finalizer so queueing an upload cannot preserve permissions
+// that have since been revoked or publish a node already in the trash.
+var ErrUploadPermission = errors.New("upload permission revoked")
+
+func ValidateUploadPermission(ctx context.Context, q permissionQuerier, userID, nodeID uuid.UUID) error {
+	var a actor
+	if err := q.QueryRow(ctx, `SELECT u.id,hm.household_id,hm.role FROM users u JOIN household_members hm ON hm.user_id=u.id JOIN nodes n ON n.id=$2 JOIN spaces sp ON sp.id=n.space_id AND sp.household_id=hm.household_id WHERE u.id=$1 AND NOT u.disabled AND n.deleted_at IS NULL AND n.purge_job_id IS NULL`, userID, nodeID).Scan(&a.UserID, &a.HouseholdID, &a.Role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUploadPermission
+		}
+		return err
+	}
+	level, err := nodePermissionWith(ctx, q, a, nodeID)
+	if err != nil {
+		return err
+	}
+	if level < permissionEditor {
+		return ErrUploadPermission
+	}
+	return nil
 }
 
 func validCompletedParts(parts []storage.CompletedPart) bool {
@@ -656,14 +682,16 @@ func (s *Server) abortUpload(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 	var lockedState string
 	if err := tx.QueryRow(r.Context(), `SELECT state FROM upload_sessions WHERE id=$1 AND user_id=$2 FOR UPDATE`, upload.ID, a.UserID).Scan(&lockedState); err != nil {
-		writeError(w, http.StatusNotFound, "not_found", "上传会话不存在")
+		if !dbNotFound(w, err) {
+			internalError(w, err)
+		}
 		return
 	}
 	if lockedState == "ready" {
 		writeError(w, http.StatusConflict, "upload_finalized", "已完成的上传不能取消，请从文件列表删除")
 		return
 	}
-	if lockedState == "pending" || lockedState == "uploading" || lockedState == "completing" {
+	if lockedState == "pending" || lockedState == "uploading" || lockedState == "completing" || lockedState == "expired" {
 		_, err = tx.Exec(r.Context(), `UPDATE spaces SET reserved_bytes=GREATEST(0,reserved_bytes-$1) WHERE id=$2`, upload.ExpectedSize, upload.SpaceID)
 	}
 	if err == nil {
@@ -681,11 +709,11 @@ func (s *Server) abortUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if upload.UploadID != nil {
-		if err := s.store.AbortMultipart(r.Context(), upload.ObjectKey, *upload.UploadID); err != nil {
+		if err := s.store.AbortMultipart(r.Context(), upload.StagingKey, *upload.UploadID); err != nil {
 			slog.Warn("multipart cleanup failed", "upload_id", upload.ID, "error", err)
 		}
 	}
-	if err := s.store.Delete(r.Context(), upload.ObjectKey); err != nil {
+	if err := s.store.Delete(r.Context(), upload.StagingKey); err != nil {
 		slog.Warn("object cleanup failed", "upload_id", upload.ID, "error", err)
 	}
 	w.WriteHeader(http.StatusNoContent)

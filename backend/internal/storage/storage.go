@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"pan/backend/internal/config"
 )
@@ -75,9 +77,9 @@ func (s *Store) Ready(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) PresignPut(ctx context.Context, key, mime string) (string, error) {
+func (s *Store) PresignPut(ctx context.Context, key, mime string, size int64) (string, error) {
 	request, err := s.signer.PresignPutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), ContentType: aws.String(mime),
+		Bucket: aws.String(s.bucket), Key: aws.String(key), ContentType: aws.String(mime), ContentLength: aws.Int64(size),
 	}, s3.WithPresignExpires(s.ttl))
 	if err != nil {
 		return "", err
@@ -95,9 +97,9 @@ func (s *Store) CreateMultipart(ctx context.Context, key, mime string) (string, 
 	return aws.ToString(result.UploadId), nil
 }
 
-func (s *Store) PresignPart(ctx context.Context, key, uploadID string, part int32) (string, error) {
+func (s *Store) PresignPart(ctx context.Context, key, uploadID string, part int32, size int64) (string, error) {
 	request, err := s.signer.PresignUploadPart(ctx, &s3.UploadPartInput{
-		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(part),
+		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID), PartNumber: aws.Int32(part), ContentLength: aws.Int64(size),
 	}, s3.WithPresignExpires(s.ttl))
 	if err != nil {
 		return "", err
@@ -124,6 +126,10 @@ func (s *Store) AbortMultipart(ctx context.Context, key, uploadID string) error 
 	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
 	})
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchUpload" {
+		return nil
+	}
 	return err
 }
 

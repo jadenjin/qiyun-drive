@@ -30,6 +30,17 @@ func (s *Server) bootstrapStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) bootstrap(w http.ResponseWriter, r *http.Request) {
+	// Keep the locked check below for concurrent first-run requests, but
+	// reject an already initialized installation before any password work.
+	var initialized bool
+	if err := s.db.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM households)`).Scan(&initialized); err != nil {
+		internalError(w, err)
+		return
+	}
+	if initialized {
+		writeError(w, http.StatusConflict, "already_initialized", "系统已经完成初始化")
+		return
+	}
 	var input struct {
 		HouseholdName string `json:"householdName"`
 		Timezone      string `json:"timezone"`
@@ -104,6 +115,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
+		Code     string `json:"code"`
 	}
 	if !decodeJSON(w, r, &input) {
 		return
@@ -117,7 +129,18 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	err := s.db.QueryRow(r.Context(), `SELECT id,password_hash FROM users WHERE lower(username)=$1 AND NOT disabled`, normalizeUsername(input.Username)).Scan(&userID, &passwordHash)
 	passwordOK := panAuth.VerifyPassword(passwordHash, input.Password)
 	if err != nil || !passwordOK {
+		s.failedSecurityEvent(r, userID, "login.password_denied")
 		writeError(w, http.StatusUnauthorized, "invalid_credentials", "用户名或密码错误")
+		return
+	}
+	verified, err := s.verifySecondFactor(r, userID, input.Code)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !verified {
+		s.failedSecurityEvent(r, userID, "login.mfa_denied")
+		writeError(w, 401, "mfa_required", "请输入有效的身份验证器验证码或一次性恢复码")
 		return
 	}
 	s.createSession(w, r, userID)
@@ -130,7 +153,11 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request, userID uu
 		return
 	}
 	expires := time.Now().Add(30 * 24 * time.Hour)
-	if _, err := s.db.Exec(r.Context(), `INSERT INTO sessions(id,user_id,token_hash,expires_at) VALUES($1,$2,$3,$4)`, uuid.New(), userID, hash, expires); err != nil {
+	if _, err := s.db.Exec(r.Context(), `INSERT INTO sessions(id,user_id,token_hash,expires_at,user_agent,source_ip) VALUES($1,$2,$3,$4,$5,$6)`, uuid.New(), userID, hash, expires, securityAgent(r.UserAgent()), s.clientIP(r)); err != nil {
+		internalError(w, err)
+		return
+	}
+	if err := s.securityEvent(r, userID, "login.success"); err != nil {
 		internalError(w, err)
 		return
 	}
@@ -212,7 +239,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	if _, err = tx.Exec(r.Context(), `UPDATE users SET password_hash=$1 WHERE id=$2`, newHash, a.UserID); err == nil {
+	if _, err = tx.Exec(r.Context(), `UPDATE users SET password_hash=$1,totp_pending_secret=NULL,totp_pending_expires=NULL WHERE id=$2`, newHash, a.UserID); err == nil {
 		_, err = tx.Exec(r.Context(), `DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2`, a.UserID, panAuth.TokenHash(cookie.Value))
 	}
 	if err == nil {
@@ -227,6 +254,10 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.audit(r.Context(), a, "account.password_update", "user", &a.UserID, nil)
+	if err := s.securityEvent(r, a.UserID, "password.changed"); err != nil {
+		internalError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -467,7 +498,7 @@ func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusGone, "invalid_reset", "重置链接无效或已过期")
 		return
 	}
-	if _, err := tx.Exec(r.Context(), `UPDATE users SET password_hash=$1 WHERE id=$2`, hash, userID); err == nil {
+	if _, err := tx.Exec(r.Context(), `UPDATE users SET password_hash=$1,totp_pending_secret=NULL,totp_pending_expires=NULL WHERE id=$2`, hash, userID); err == nil {
 		_, err = tx.Exec(r.Context(), `UPDATE password_resets SET used_at=now() WHERE user_id=$1 AND used_at IS NULL`, userID)
 	}
 	if err == nil {
@@ -478,6 +509,10 @@ func (s *Server) completePasswordReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := tx.Commit(r.Context()); err != nil {
+		internalError(w, err)
+		return
+	}
+	if err := s.securityEvent(r, userID, "password.reset"); err != nil {
 		internalError(w, err)
 		return
 	}
@@ -492,7 +527,7 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	currentHash := panAuth.TokenHash(cookie.Value)
-	rows, err := s.db.Query(r.Context(), `SELECT id,token_hash,created_at,last_seen_at,expires_at FROM sessions WHERE user_id=$1 AND expires_at>now() ORDER BY last_seen_at DESC`, a.UserID)
+	rows, err := s.db.Query(r.Context(), `SELECT id,token_hash,created_at,last_seen_at,expires_at,user_agent,source_ip FROM sessions WHERE user_id=$1 AND expires_at>now() ORDER BY last_seen_at DESC`, a.UserID)
 	if err != nil {
 		internalError(w, err)
 		return
@@ -502,12 +537,13 @@ func (s *Server) listSessions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id uuid.UUID
 		var hash string
+		var userAgent, sourceIP string
 		var createdAt, lastSeenAt, expiresAt time.Time
-		if err := rows.Scan(&id, &hash, &createdAt, &lastSeenAt, &expiresAt); err != nil {
+		if err := rows.Scan(&id, &hash, &createdAt, &lastSeenAt, &expiresAt, &userAgent, &sourceIP); err != nil {
 			internalError(w, err)
 			return
 		}
-		items = append(items, map[string]any{"id": id, "current": hash == currentHash, "createdAt": createdAt, "lastSeenAt": lastSeenAt, "expiresAt": expiresAt})
+		items = append(items, map[string]any{"id": id, "current": hash == currentHash, "createdAt": createdAt, "lastSeenAt": lastSeenAt, "expiresAt": expiresAt, "device": deviceLabel(userAgent), "sourceIp": sourceIP, "sourceLabel": sourceLabel(sourceIP)})
 	}
 	if err := rows.Err(); err != nil {
 		internalError(w, err)
@@ -533,6 +569,10 @@ func (s *Server) revokeSession(w http.ResponseWriter, r *http.Request) {
 		clearCookie(w, s.cfg.CookieSecure)
 	}
 	s.audit(r.Context(), a, "account.session_revoke", "session", &id, nil)
+	if err := s.securityEvent(r, a.UserID, "session.revoked"); err != nil {
+		internalError(w, err)
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

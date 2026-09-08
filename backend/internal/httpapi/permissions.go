@@ -118,11 +118,15 @@ func nodePermissionWith(ctx context.Context, db permissionQuerier, a actor, node
 // nodePermissions resolves many nodes in one recursive query. Listing a large
 // directory or photo timeline must not issue one permission query per item.
 func (s *Server) nodePermissions(ctx context.Context, a actor, spaceID uuid.UUID, nodeIDs []uuid.UUID) (map[uuid.UUID]int, error) {
+	return nodePermissionsWith(ctx, s.db, a, spaceID, nodeIDs)
+}
+
+func nodePermissionsWith(ctx context.Context, db permissionQuerier, a actor, spaceID uuid.UUID, nodeIDs []uuid.UUID) (map[uuid.UUID]int, error) {
 	result := make(map[uuid.UUID]int, len(nodeIDs))
 	if len(nodeIDs) == 0 {
 		return result, nil
 	}
-	base, err := s.spacePermission(ctx, a, spaceID)
+	base, err := spacePermissionWith(ctx, db, a, spaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +136,7 @@ func (s *Server) nodePermissions(ctx context.Context, a actor, spaceID uuid.UUID
 		}
 		return result, nil
 	}
-	rows, err := s.db.Query(ctx, `
+	rows, err := db.Query(ctx, `
 		WITH RECURSIVE chain(target_id,id,parent_id,inherit_permissions,depth) AS (
 			SELECT n.id,n.id,n.parent_id,n.inherit_permissions,0
 			FROM nodes n WHERE n.id=ANY($1::uuid[]) AND n.space_id=$2
@@ -167,55 +171,28 @@ func (s *Server) nodePermissions(ctx context.Context, a actor, spaceID uuid.UUID
 }
 
 func (s *Server) subtreePermissionAtLeast(ctx context.Context, a actor, nodeID uuid.UUID, required int) (bool, error) {
-	rows, err := s.db.Query(ctx, `
-		WITH RECURSIVE tree AS (
-		  SELECT id FROM nodes WHERE id=$1
-		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id
-		)
-		SELECT id FROM tree`, nodeID)
-	if err != nil {
-		return false, err
-	}
-	ids := make([]uuid.UUID, 0)
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return false, err
-		}
-		ids = append(ids, id)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return false, err
-	}
-	for _, id := range ids {
-		level, err := s.nodePermission(ctx, a, id)
-		if err != nil {
-			return false, err
-		}
-		if level < required {
-			return false, nil
-		}
-	}
-	return len(ids) > 0, nil
+	return subtreePermissionAtLeastWith(ctx, s.db, a, nodeID, required, false)
 }
 
 func (s *Server) activeSubtreePermissionAtLeast(ctx context.Context, a actor, nodeID uuid.UUID, required int) (bool, error) {
-	rows, err := s.db.Query(ctx, `
+	return subtreePermissionAtLeastWith(ctx, s.db, a, nodeID, required, true)
+}
+
+func subtreePermissionAtLeastWith(ctx context.Context, db permissionQuerier, a actor, nodeID uuid.UUID, required int, activeOnly bool) (bool, error) {
+	rows, err := db.Query(ctx, `
 		WITH RECURSIVE tree AS (
-		  SELECT id FROM nodes WHERE id=$1 AND deleted_at IS NULL
-		  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NULL
+		  SELECT id,space_id FROM nodes WHERE id=$1 AND (NOT $2 OR deleted_at IS NULL)
+		  UNION SELECT n.id,n.space_id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE NOT $2 OR n.deleted_at IS NULL
 		)
-		SELECT id FROM tree`, nodeID)
+		SELECT id,space_id FROM tree`, nodeID, activeOnly)
 	if err != nil {
 		return false, err
 	}
 	ids := make([]uuid.UUID, 0)
+	var spaceID uuid.UUID
 	for rows.Next() {
 		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		if err := rows.Scan(&id, &spaceID); err != nil {
 			rows.Close()
 			return false, err
 		}
@@ -226,12 +203,12 @@ func (s *Server) activeSubtreePermissionAtLeast(ctx context.Context, a actor, no
 	if err != nil {
 		return false, err
 	}
+	permissions, err := nodePermissionsWith(ctx, db, a, spaceID, ids)
+	if err != nil {
+		return false, err
+	}
 	for _, id := range ids {
-		level, err := s.nodePermission(ctx, a, id)
-		if err != nil {
-			return false, err
-		}
-		if level < required {
+		if permissions[id] < required {
 			return false, nil
 		}
 	}

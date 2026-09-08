@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -11,6 +12,8 @@ import (
 )
 
 type Config struct {
+	OpsDirectory     string
+	MFAEncryptionKey string
 	Addr             string
 	DatabaseURL      string
 	PublicBaseURL    string
@@ -50,6 +53,8 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
+		OpsDirectory:     env("OPS_DIRECTORY", "/var/lib/qiyun-ops"),
+		MFAEncryptionKey: env("MFA_ENCRYPTION_KEY", ""),
 		Addr:             env("ADDR", ":8080"),
 		DatabaseURL:      env("DATABASE_URL", "postgres://pan:pan@localhost:5432/pan?sslmode=disable"),
 		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:3000"), "/"),
@@ -73,6 +78,12 @@ func Load() (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.MFAEncryptionKey != "" {
+		key, err := hex.DecodeString(c.MFAEncryptionKey)
+		if err != nil || len(key) != 32 {
+			return fmt.Errorf("MFA_ENCRYPTION_KEY must contain 64 hexadecimal characters")
+		}
+	}
 	publicURL, err := validateHTTPURL("PUBLIC_BASE_URL", c.PublicBaseURL)
 	if err != nil {
 		return err

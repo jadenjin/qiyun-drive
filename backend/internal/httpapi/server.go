@@ -26,10 +26,15 @@ import (
 )
 
 type Server struct {
-	db    *pgxpool.Pool
-	store *storage.Store
-	cfg   config.Config
-	limit *attemptLimiter
+	db            databaseHandle
+	eventDB       databaseHandle
+	store         *storage.Store
+	cfg           config.Config
+	limit         *attemptLimiter
+	passwordSlots chan struct{}
+	archiveSlots  chan struct{}
+	onRollback    *[]func(context.Context)
+	mutationError *error
 }
 
 type attemptWindow struct {
@@ -59,7 +64,7 @@ type contextKey string
 const actorKey contextKey = "actor"
 
 func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler {
-	s := &Server{db: db, store: store, cfg: cfg, limit: newAttemptLimiter()}
+	s := &Server{db: db, eventDB: db, store: store, cfg: cfg, limit: newAttemptLimiter(), passwordSlots: make(chan struct{}, 2), archiveSlots: make(chan struct{}, 2)}
 	r := chi.NewRouter()
 	r.Use(s.recoverer, s.securityHeaders, s.requestLog, s.cors)
 	r.Get("/health/live", func(w http.ResponseWriter, _ *http.Request) {
@@ -68,71 +73,93 @@ func New(db *pgxpool.Pool, store *storage.Store, cfg config.Config) http.Handler
 	r.Get("/health/ready", s.ready)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/bootstrap", s.bootstrapStatus)
-		r.Post("/bootstrap", s.bootstrap)
-		r.With(s.limitSensitive).Post("/auth/login", s.login)
-		r.With(s.limitSensitive).Post("/invitations/accept", s.acceptInvitation)
-		r.With(s.limitSensitive).Post("/password-resets/complete", s.completePasswordReset)
-		r.With(s.limitSensitive).Post("/public/shares/{token}/unlock", s.unlockShare)
+		r.With(s.limitSensitive, s.limitPasswordWork).Post("/bootstrap", s.write((*Server).bootstrap))
+		r.With(s.limitSensitive, s.limitPasswordWork).Post("/auth/login", s.write((*Server).login))
+		r.With(s.limitSensitive, s.limitPasswordWork).Post("/invitations/accept", s.write((*Server).acceptInvitation))
+		r.With(s.limitSensitive, s.limitPasswordWork).Post("/password-resets/complete", s.write((*Server).completePasswordReset))
+		r.With(s.limitSensitive, s.limitPasswordWork).Post("/public/shares/{token}/unlock", s.write((*Server).unlockShare))
 		r.Get("/public/shares/{token}", s.publicShare)
-		r.Post("/public/shares/{token}/archive", s.publicShareArchive)
+		r.With(s.limitArchive).Post("/public/shares/{token}/archive", s.publicShareArchive)
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireAuth)
 			r.Get("/me", s.me)
-			r.Patch("/me", s.updateMe)
-			r.Post("/me/password", s.changePassword)
+			r.Patch("/me", s.write((*Server).updateMe))
+			r.With(s.limitSensitive, s.limitPasswordWork).Post("/me/password", s.write((*Server).changePassword))
 			r.Get("/me/sessions", s.listSessions)
-			r.Delete("/me/sessions/{id}", s.revokeSession)
-			r.Post("/auth/logout", s.logout)
+			r.Get("/me/security", s.accountSecurity)
+			r.With(s.limitSensitive, s.limitPasswordWork).Post("/me/totp/setup", s.write((*Server).beginTOTP))
+			r.With(s.limitSensitive).Post("/me/totp/confirm", s.write((*Server).confirmTOTP))
+			r.With(s.limitSensitive, s.limitPasswordWork).Post("/me/totp/disable", s.write((*Server).disableTOTP))
+			r.Delete("/me/sessions/{id}", s.write((*Server).revokeSession))
+			r.Post("/auth/logout", s.write((*Server).logout))
 			r.Get("/spaces", s.listSpaces)
 			r.Get("/nodes", s.listNodes)
 			r.Get("/folders/tree", s.listFolderTree)
-			r.Post("/folders", s.createFolder)
-			r.Patch("/nodes/{id}", s.renameNode)
-			r.Post("/nodes/{id}/move", s.moveNode)
-			r.Delete("/nodes/{id}", s.trashNode)
+			r.Post("/folders", s.write((*Server).createFolder))
+			r.Patch("/nodes/{id}", s.write((*Server).renameNode))
+			r.Post("/nodes/{id}/move", s.write((*Server).moveNode))
+			r.Delete("/nodes/{id}", s.write((*Server).trashNode))
 			r.Get("/trash", s.listTrash)
-			r.Post("/trash/{id}/restore", s.restoreNode)
-			r.Delete("/trash/{id}", s.purgeNode)
-			r.Post("/upload-batches", s.createUploadBatch)
-			r.Post("/uploads", s.createUpload)
-			r.Post("/uploads/{id}/parts", s.presignParts)
-			r.Post("/uploads/{id}/resume", s.resumeUpload)
-			r.Post("/uploads/{id}/complete", s.completeUpload)
-			r.Delete("/uploads/{id}", s.abortUpload)
+			r.Post("/trash/{id}/restore", s.write((*Server).restoreNode))
+			r.Delete("/trash/{id}", s.write((*Server).purgeNode))
+			r.Post("/upload-batches", s.write((*Server).createUploadBatch))
+			r.Post("/uploads", s.write((*Server).createUpload))
+			r.Post("/uploads/{id}/parts", s.write((*Server).presignParts))
+			r.Post("/uploads/{id}/resume", s.write((*Server).resumeUpload))
+			r.Post("/uploads/{id}/complete", s.write((*Server).completeUpload))
+			r.Delete("/uploads/{id}", s.write((*Server).abortUpload))
 			r.Get("/uploads", s.listUploads)
 			r.Get("/nodes/{id}/download", s.downloadFile)
 			r.Get("/nodes/{id}/preview", s.previewFile)
-			r.Get("/nodes/{id}/archive", s.downloadArchive)
+			r.With(s.limitArchive).Get("/nodes/{id}/archive", s.downloadArchive)
 			r.Get("/photos", s.listPhotos)
-			r.Patch("/photos/{id}", s.updatePhoto)
+			r.Patch("/photos/{id}", s.write((*Server).updatePhoto))
 			r.Get("/albums", s.listAlbums)
-			r.Post("/albums", s.createAlbum)
-			r.Patch("/albums/{id}", s.updateAlbum)
-			r.Delete("/albums/{id}", s.deleteAlbum)
-			r.Post("/albums/{id}/items", s.addAlbumItems)
-			r.Delete("/albums/{id}/items/{nodeID}", s.removeAlbumItem)
+			r.Post("/albums", s.write((*Server).createAlbum))
+			r.Patch("/albums/{id}", s.write((*Server).updateAlbum))
+			r.Delete("/albums/{id}", s.write((*Server).deleteAlbum))
+			r.Post("/albums/{id}/items", s.write((*Server).addAlbumItems))
+			r.Delete("/albums/{id}/items/{nodeID}", s.write((*Server).removeAlbumItem))
 			r.Get("/albums/{id}/items", s.listAlbumItems)
 			r.Get("/nodes/{id}/permissions", s.getNodePermissions)
-			r.Put("/nodes/{id}/permissions", s.setNodePermissions)
+			r.Put("/nodes/{id}/permissions", s.write((*Server).setNodePermissions))
 			r.Get("/albums/{id}/permissions", s.getAlbumPermissions)
-			r.Put("/albums/{id}/permissions", s.setAlbumPermissions)
-			r.Post("/shares", s.createShare)
+			r.Put("/albums/{id}/permissions", s.write((*Server).setAlbumPermissions))
+			r.With(s.limitPasswordWork).Post("/shares", s.write((*Server).createShare))
 			r.Get("/shares", s.listShares)
-			r.Delete("/shares/{id}", s.revokeShare)
+			r.Delete("/shares/{id}", s.write((*Server).revokeShare))
 			r.Get("/members", s.listMembers)
-			r.Post("/invitations", s.createInvitation)
-			r.Post("/members/{id}/password-reset", s.createPasswordReset)
-			r.Patch("/members/{id}", s.updateMemberRole)
-			r.Patch("/spaces/{id}/quota", s.updateQuota)
+			r.Post("/invitations", s.write((*Server).createInvitation))
+			r.Post("/members/{id}/password-reset", s.write((*Server).createPasswordReset))
+			r.Patch("/members/{id}", s.write((*Server).updateMemberRole))
+			r.Patch("/spaces/{id}/quota", s.write((*Server).updateQuota))
 			r.Get("/admin/audit", s.listAudit)
+			r.Get("/admin/operations", s.operations)
 		})
 	})
 	return r
 }
 
+// Bound aggregate Argon2 memory even when requests arrive concurrently or
+// through many addresses. Reject excess work rather than building a queue.
+func (s *Server) limitPasswordWork(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case s.passwordSlots <- struct{}{}:
+			defer func() { <-s.passwordSlots }()
+			next.ServeHTTP(w, r)
+		default:
+			w.Header().Set("Retry-After", "2")
+			writeError(w, http.StatusTooManyRequests, "busy", "服务繁忙，请稍后重试")
+		}
+	})
+}
+
 func (s *Server) limitSensitive(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := s.clientIP(r) + ":" + r.URL.Path
+		// All share tokens share one budget; rotating token paths must not
+		// create an unlimited number of independent authentication budgets.
+		key := s.clientIP(r) + ":" + safeLogPath(r.URL.Path)
 		now := time.Now()
 		allowed, retryAfter := s.limit.allowed(key, now)
 		if !allowed {
@@ -229,6 +256,8 @@ type statusRecorder struct {
 	bytes  int
 }
 
+func (w *statusRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *statusRecorder) WriteHeader(status int) {
 	if w.status != 0 {
 		return
@@ -263,7 +292,8 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	if err := s.db.Ping(ctx); err != nil {
+	var alive int
+	if err := s.db.QueryRow(ctx, "SELECT 1").Scan(&alive); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "数据库尚未就绪")
 		return
 	}
@@ -434,15 +464,35 @@ func isUniqueViolation(err error, constraint string) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505" && (constraint == "" || pgErr.ConstraintName == constraint)
 }
 
+func isConcurrentChange(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
 func internalError(w http.ResponseWriter, err error) {
+	if isConcurrentChange(err) {
+		writeError(w, http.StatusConflict, "concurrent_change", "内容正在变化，请刷新后重试")
+		return
+	}
 	slog.Error("request failed", "error", err)
 	writeError(w, http.StatusInternalServerError, "internal_error", "操作失败，请稍后重试")
 }
 
 func (s *Server) audit(ctx context.Context, a actor, action, resourceType string, resourceID *uuid.UUID, metadata any) {
-	payload, _ := json.Marshal(metadata)
-	_, _ = s.db.Exec(ctx, `INSERT INTO audit_events(id,household_id,actor_user_id,action,resource_type,resource_id,metadata) VALUES($1,$2,$3,$4,$5,$6,$7)`,
-		uuid.New(), a.HouseholdID, a.UserID, action, resourceType, resourceID, payload)
+	s.auditForSpace(ctx, a, action, resourceType, resourceID, nil, metadata)
+}
+
+func (s *Server) auditForSpace(ctx context.Context, a actor, action, resourceType string, resourceID, spaceID *uuid.UUID, metadata any) {
+	payload, err := json.Marshal(metadata)
+	if err == nil {
+		_, err = s.db.Exec(ctx, `INSERT INTO audit_events(id,household_id,actor_user_id,action,resource_type,resource_id,metadata,visibility) VALUES($1,$2,$3,$4,$5,$6,$7,audit_visibility($2,$5,$6,$8))`, uuid.New(), a.HouseholdID, a.UserID, action, resourceType, resourceID, payload, spaceID)
+	}
+	if err != nil {
+		slog.Error("audit write failed", "action", action, "error", err)
+		if s.mutationError != nil {
+			*s.mutationError = err
+		}
+	}
 }
 
 func normalizeUsername(value string) string { return strings.ToLower(strings.TrimSpace(value)) }

@@ -232,18 +232,22 @@ func (s *Server) createFolder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) parentPermission(ctx context.Context, a actor, spaceID uuid.UUID, parentID *uuid.UUID) (int, error) {
+	return parentPermissionWith(ctx, s.db, a, spaceID, parentID)
+}
+
+func parentPermissionWith(ctx context.Context, db permissionQuerier, a actor, spaceID uuid.UUID, parentID *uuid.UUID) (int, error) {
 	if parentID == nil {
-		return s.spacePermission(ctx, a, spaceID)
+		return spacePermissionWith(ctx, db, a, spaceID)
 	}
 	var actualSpace uuid.UUID
 	var kind string
-	if err := s.db.QueryRow(ctx, `SELECT space_id,kind FROM nodes WHERE id=$1 AND deleted_at IS NULL`, *parentID).Scan(&actualSpace, &kind); err != nil {
+	if err := db.QueryRow(ctx, `SELECT space_id,kind FROM nodes WHERE id=$1 AND deleted_at IS NULL`, *parentID).Scan(&actualSpace, &kind); err != nil {
 		return permissionNone, err
 	}
 	if actualSpace != spaceID || kind != "folder" {
 		return permissionNone, pgx.ErrNoRows
 	}
-	return s.nodePermission(ctx, a, *parentID)
+	return nodePermissionWith(ctx, db, a, *parentID)
 }
 
 func (s *Server) renameNode(w http.ResponseWriter, r *http.Request) {
@@ -286,7 +290,13 @@ func (s *Server) moveNode(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	level, err := s.nodePermission(r.Context(), a, id)
+	tx, err := s.db.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	defer tx.Rollback(r.Context())
+	level, err := nodePermissionWith(r.Context(), tx, a, id)
 	if err != nil || level < permissionEditor {
 		writeError(w, http.StatusNotFound, "not_found", "资源不存在")
 		return
@@ -300,7 +310,7 @@ func (s *Server) moveNode(w http.ResponseWriter, r *http.Request) {
 	var spaceID uuid.UUID
 	var currentParent *uuid.UUID
 	var kind, name string
-	if err := s.db.QueryRow(r.Context(), `SELECT space_id,parent_id,kind,name FROM nodes WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&spaceID, &currentParent, &kind, &name); err != nil {
+	if err := tx.QueryRow(r.Context(), `SELECT space_id,parent_id,kind,name FROM nodes WHERE id=$1 AND deleted_at IS NULL`, id).Scan(&spaceID, &currentParent, &kind, &name); err != nil {
 		dbNotFound(w, err)
 		return
 	}
@@ -308,14 +318,25 @@ func (s *Server) moveNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_parent", "不能把文件夹移动到自身")
 		return
 	}
-	targetLevel, err := s.parentPermission(r.Context(), a, spaceID, input.ParentID)
+	targetLevel, err := parentPermissionWith(r.Context(), tx, a, spaceID, input.ParentID)
 	if err != nil || targetLevel < permissionEditor {
 		writeError(w, http.StatusNotFound, "not_found", "目标目录不存在")
 		return
 	}
+	if kind == "folder" {
+		allowed, err := subtreePermissionAtLeastWith(r.Context(), tx, a, id, permissionEditor, false)
+		if err != nil {
+			internalError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "subtree_forbidden", "目录中包含你无权移动的内容")
+			return
+		}
+	}
 	if kind == "folder" && input.ParentID != nil {
 		var descendant bool
-		err = s.db.QueryRow(r.Context(), `
+		err = tx.QueryRow(r.Context(), `
 			WITH RECURSIVE tree AS (
 			  SELECT id FROM nodes WHERE id=$1
 			  UNION ALL SELECT n.id FROM nodes n JOIN tree t ON n.parent_id=t.id WHERE n.deleted_at IS NULL
@@ -330,12 +351,24 @@ func (s *Server) moveNode(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if _, err := s.db.Exec(r.Context(), `UPDATE nodes SET parent_id=$1,updated_at=now() WHERE id=$2`, input.ParentID, id); err != nil {
+	if _, err := tx.Exec(r.Context(), `UPDATE nodes SET parent_id=$1,updated_at=now() WHERE id=$2`, input.ParentID, id); err != nil {
+		if isConcurrentChange(err) {
+			writeError(w, http.StatusConflict, "concurrent_change", "目录正在变化，请刷新后重试")
+			return
+		}
 		if strings.Contains(err.Error(), "nodes_active_name_idx") {
 			writeError(w, http.StatusConflict, "name_conflict", "目标目录已存在同名内容")
 			return
 		}
 		internalError(w, err)
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		if isConcurrentChange(err) {
+			writeError(w, http.StatusConflict, "concurrent_change", "目录正在变化，请刷新后重试")
+		} else {
+			internalError(w, err)
+		}
 		return
 	}
 	s.audit(r.Context(), a, "node.move", "node", &id, map[string]any{"name": name, "fromParentId": currentParent, "toParentId": input.ParentID})
@@ -673,7 +706,7 @@ func (s *Server) downloadArchive(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename*=UTF-8''%s.zip", pathEscape(rootName)))
-	zw := zip.NewWriter(w)
+	zw := zip.NewWriter(archiveWriter{r.Context(), w})
 	defer zw.Close()
 	for _, entry := range entries {
 		body, err := s.store.Get(r.Context(), entry.Key)
