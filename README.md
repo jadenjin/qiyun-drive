@@ -1,6 +1,6 @@
 # 栖云家庭网盘
 
-栖云是一个 Go + React + PostgreSQL + RustFS 实现的自托管家庭网盘。每位成员拥有管理员也无法浏览的私有空间，同时可以在家庭空间内按目录授予查看、编辑或管理权限。
+栖云是一个 Go + React + PostgreSQL + RustFS 实现的自托管家庭网盘。每位成员拥有通过应用权限隔离的私有空间，同时可以在家庭空间内按目录授予查看、编辑或管理权限。
 
 ## 功能介绍
 
@@ -77,7 +77,7 @@ PostgreSQL、RustFS API 和管理控制台默认仅绑定到 `127.0.0.1`，不�
 docker compose -f compose.yaml -f compose.production.yaml -f compose.device.yaml up --build -d
 ```
 
-设备 `.env` 中把 `PUBLIC_BASE_URL` 与 `SITE_ADDRESS` 设为局域网入口，把 `S3_PUBLIC_ENDPOINT` 设为浏览器可访问的 RustFS 地址（设备覆盖默认使用 9100）。`compose.device.yaml` 会把 RustFS 数据绑定到 `/srv/qiyun-drive-rustfs`。设备部署用机械盘上的独立 ext4 镜像挂载该目录，使以整个 `/mnt/data` 为数据根的宿主机 RustFS 只能看到普通镜像文件，无法扫描栖云实例的数据树。
+设备 `.env` 中把 `PUBLIC_BASE_URL`、`SITE_ADDRESS` 和 `S3_PUBLIC_ENDPOINT` 设为同一个局域网入口（例如 `http://192.168.1.19`）。Caddy 通过 `/pan-objects/*` 代理签名对象请求，页面、上传和下载共用一个端口；9100 与 9101 仅绑定回环地址。`compose.device.yaml` 会把 RustFS 数据绑定到 `/srv/qiyun-drive-rustfs`。设备部署用机械盘上的独立 ext4 镜像挂载该目录，使以整个 `/mnt/data` 为数据根的宿主机 RustFS 只能看到普通镜像文件，无法扫描栖云实例的数据树。
 
 ## 本地开发
 
@@ -108,7 +108,11 @@ go run ./cmd/worker
 - RustFS 保存原始文件和派生缩略图。
 - 回收站内容仍计入配额，默认 30 天后由 Worker 永久清理。
 
-Windows/PowerShell 可执行 `.\scripts\backup.ps1` 生成一致性备份和 SHA-256 清单。恢复时应先恢复 PostgreSQL，再恢复同一备份目录中的 RustFS 数据，并先在隔离环境验证。设备覆盖模式下 RustFS 数据挂载于 `/srv/qiyun-drive-rustfs`（镜像文件位于 `/mnt/data/.qiyun-drive-storage.img`），不在 Compose 数据卷中，应使用宿主机快照或独立的 S3 级备份流程。
+设备上使用 `sh scripts/backup.sh`，会识别实际 RustFS 挂载，同时保存数据库、对象、配置、镜像及 SHA-256 清单。设备对象目录为 `/srv/qiyun-drive-rustfs`，底层镜像文件位于 `/mnt/data/.qiyun-drive-storage.img`。Windows 异机复制使用 `scripts/collect-backup.ps1`；`scripts/restore-latest.sh` 在独立存储恢复整套服务并校验抽样文件。备份写入冻结期间网盘入口短暂不可用。
+
+账户设置中的“登录安全”支持可选动态码二次验证、一次性恢复码和安全事件。部署前生成并备份 `MFA_ENCRYPTION_KEY`（64 位十六进制），它用于加密账户密钥；已开启二次验证后不能随意更换或丢弃该配置。恢复码只展示一次，应离线保存。
+
+上传先进入暂存对象，校验大小与 SHA-256 后发布到新的正式路径。刷新后续传只保存元数据、摘要及分片进度，大文件需要重新选择原文件；系统核对内容后只补传缺失分片。照片时间线支持游标分页和虚拟列表。家庭所有者可在“成员与权限”查看后台任务、磁盘、备份及恢复状态。
 
 完整的发布检查、备份恢复、监控和故障处理见 [运维手册](docs/operations.md)。
 
@@ -142,3 +146,11 @@ GitHub Actions 会额外启动一次性 PostgreSQL 与 RustFS，运行真实 API
 - 最近一次全量审计的范围、修复项与剩余部署边界见 [安全审计报告](docs/security-audit.md)。
 
 当前 v1 不包含原生同步客户端、文件版本、视频转码、AI 人脸识别、Office 在线编辑和端到端加密。
+
+## 单端口部署与安全边界
+
+单端口对象代理的配置见 [运维手册](docs/operations.md)，上传和权限变更的提交规则见 [事务一致性约定](docs/transaction-consistency.md)。
+
+FRP 只需转发网盘入口；无需转发 9100、9101、5432 或 SSH。公网 HTTP 即使经过加密的 FRP 隧道，浏览器到公网入口仍是明文，不能保证密码、Cookie 和文件传输安全。配置校验仍拒绝公网 HTTP，不会自动降级。内网入口当前使用 HTTP。
+
+“私有空间”属于应用授权隔离，不是端到端加密；宿主机 root、数据库管理员或有权重置账号凭据的人不属于这一保密边界。
